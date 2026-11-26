@@ -1,0 +1,18 @@
+# Slim dependency set for the DEPLOYED web server (PythonAnywhere, etc.).
+#
+# The live dashboard (dash_app.py) only reads the pre-generated
+# pipeline_cache.json — it never calls yfinance, the scipy optimizer,
+# matplotlib/seaborn, or the Fama-French regression at runtime. Those are
+# only needed locally when you run precompute_cache.py (use the full
+# requirements.txt for that).
+#
+# Installing only this list on the server avoids pulling in yfinance's heavy
+# dependency chain (curl_cffi, protobuf, etc.) and matplotlib/scipy, which is
+# what causes disk-quota failures on PythonAnywhere's free tier.
+
+pandas
+numpy
+plotly
+dash
+dash-bootstrap-components
+gunicorn

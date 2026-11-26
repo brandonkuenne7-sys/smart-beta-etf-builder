@@ -1,0 +1,55 @@
+# =============================================================================
+# OPTIONAL: Free automatic weekly data refresh.
+#
+# This ONLY works if your project lives in a GitHub repo. It reruns
+# precompute_cache.py on GitHub's servers every week, and commits the fresh
+# pipeline_cache.json straight back into the repo.
+#
+# - If you're hosting on RENDER: Render auto-redeploys on every push to
+#   main, so this alone gives you fully hands-off weekly updates for $0.
+# - If you're hosting on PYTHONANYWHERE: this keeps the repo itself
+#   current, but PythonAnywhere won't pick up the change by itself — you'd
+#   still need to `git pull` the new file into /home/you/mysite (manually,
+#   or via a Scheduled Task if you're on a paid plan). Ask if you want that
+#   automated too.
+#
+# To use this: put this file at .github/workflows/refresh_data.yml in your
+# repo (create the .github/workflows/ folders if they don't exist), push it,
+# and GitHub will handle the rest. You can also trigger it manually anytime
+# from the repo's "Actions" tab ("Run workflow" button).
+# =============================================================================
+
+name: Refresh Smart Beta Data
+
+on:
+  schedule:
+    # Runs every Monday at 12:00 UTC. Adjust the cron expression to taste:
+    # https://crontab.guru is handy for building these.
+    - cron: "0 12 * * 1"
+  workflow_dispatch: {}   # lets you click "Run workflow" manually on GitHub
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Regenerate pipeline_cache.json
+        run: python precompute_cache.py
+
+      - name: Commit updated cache if it changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pipeline_cache.json
+          git diff --staged --quiet || git commit -m "Automated weekly data refresh"
+          git push
