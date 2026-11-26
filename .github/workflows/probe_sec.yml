@@ -1,0 +1,19 @@
+name: Probe SEC EDGAR (temporary)
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          UA="smart-beta-etf-builder research project (https://github.com/brandonkuenne7-sys/smart-beta-etf-builder)"
+          curl -sS -o t.json -w "tickers %{http_code} %{size_download}\n" -A "$UA" https://www.sec.gov/files/company_tickers.json
+          curl -sS --compressed -o f.json -w "facts %{http_code} %{size_download}\n" -A "$UA" https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json
+          python3 - <<'PY'
+          import json
+          t=json.load(open('t.json')); print('tickers', len(t), [v for v in t.values() if v['ticker'] in ('BRK-B','GOOGL','META')])
+          f=json.load(open('f.json')); g=f['facts']
+          print('namespaces', list(g))
+          print('dei', list(g.get('dei',{}))[:10])
+          ni=g['us-gaap']['NetIncomeLoss']['units']['USD'][-3:]; print(ni)
+          sh=g['dei']['EntityCommonStockSharesOutstanding']['units']['shares'][-2:]; print(sh)
+          PY
