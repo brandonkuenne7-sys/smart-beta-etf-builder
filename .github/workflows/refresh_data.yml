@@ -72,6 +72,14 @@ jobs:
       - name: Validate before publishing
         run: python validate_cache.py /tmp/new_cache.json --previous pipeline_cache.json
 
+      - name: Diagnostics (only shown when something fails)
+        if: failure()
+        run: |
+          echo "--- fundamentals snapshot ---"; cat /tmp/fundamentals_snapshot.csv || true
+          echo "--- pandas_datareader import ---"; python -c "import pandas_datareader.data" || true
+          echo "--- yfinance .info sample ---"
+          python -c "import yfinance as yf; i=yf.Ticker('AAPL').info; print(yf.__version__, len(i), {k: i.get(k) for k in ('trailingPE','priceToBook','returnOnEquity','debtToEquity','profitMargins')})" || true
+
       - name: Commit cache and monthly snapshot
         run: |
           cp /tmp/new_cache.json pipeline_cache.json
