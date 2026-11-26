@@ -65,6 +65,12 @@ def main():
     print("Running full pipeline (requires internet access to Yahoo Finance) ...")
     pipeline_output = run_pipeline(CFG)
 
+    lf = pipeline_output["latest_fundamentals"]
+    print(f"Latest fundamentals ({pipeline_output['latest_decision_date'].date()}), "
+          f"cheapest 8 by earnings yield:")
+    print((lf.assign(earnings_yield=1 / lf["trailingPE"])
+             .sort_values("earnings_yield", ascending=False).head(8).round(3)).to_string())
+
     print("Running hindsight comparison on the original fixed 30-stock universe ...")
     hindsight_cfg = dataclasses.replace(CFG, universe_mode="fixed")
     hindsight_output = run_pipeline(hindsight_cfg)
@@ -108,6 +114,12 @@ def main():
             "source": pipeline_output["fundamentals_source"],
             # [rebalance date, names, with Value inputs, with Quality inputs]
             "log": pipeline_output["fundamentals_log"],
+            "as_of": str(pipeline_output["latest_decision_date"].date()),
+            # Ratios behind the current Value / Quality scores, per ticker.
+            "latest": {
+                t: {k: (None if v != v else float(v)) for k, v in row.items()}
+                for t, row in pipeline_output["latest_fundamentals"].to_dict(orient="index").items()
+            },
         },
         "comparison": {
             "label": f"Hindsight universe (fixed {len(CFG.universe)} stocks)",

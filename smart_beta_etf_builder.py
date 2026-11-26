@@ -112,6 +112,7 @@ class Config:
     rebalance_freq: str = "M"          # monthly rebalancing
     top_pct: float = 0.5               # select top 50% of universe by factor score
     max_weight: float = 0.10           # single-name cap for optimized portfolios
+    max_position_weight: float = 0.10  # single-name cap for factor-weighted portfolios
     transaction_cost_bps: float = 10.0  # 10 bps per unit of one-way turnover
     max_missing_pct: float = 0.10      # drop tickers missing more than this fraction of data
     risk_free_annual: float = 0.03     # fallback risk-free rate if FRED/T-bill pull unavailable
@@ -201,6 +202,31 @@ class DataPipeline:
                                          else pd.Series(0.0, index=sub.index))
                 except Exception:
                     missing.append(t)
+
+        if missing:
+            # yfinance's threaded batches occasionally drop a ticker (e.g. a
+            # "database is locked" cache error). Retry those one at a time.
+            retry, missing = missing, []
+            for t in retry:
+                try:
+                    sub = yf.download(t, start=start, end=self.cfg.end_date, auto_adjust=False,
+                                      actions=True, progress=False, threads=False)
+                    if isinstance(sub.columns, pd.MultiIndex):
+                        sub = sub.droplevel(1, axis=1) if sub.columns.nlevels > 1 else sub
+                    adj = sub["Adj Close"]
+                    if getattr(adj, "ndim", 1) > 1:
+                        adj = adj.iloc[:, 0]
+                    if adj.notna().sum() == 0:
+                        raise KeyError(t)
+                    col = lambda c: (sub[c].iloc[:, 0] if getattr(sub[c], "ndim", 1) > 1 else sub[c])
+                    cols["prices"][t] = adj
+                    cols["close"][t] = col("Close")
+                    cols["volume"][t] = col("Volume")
+                    cols["splits"][t] = col("Stock Splits") if "Stock Splits" in sub else pd.Series(0.0, index=sub.index)
+                except Exception:
+                    missing.append(t)
+            if len(retry) > len(missing):
+                print(f"  recovered {len(retry) - len(missing)} tickers on individual retry")
 
         if missing:
             preview = ", ".join(sorted(missing)[:15])
@@ -663,7 +689,27 @@ class PortfolioConstructor:
         top = scores.sort_values(ascending=False).head(n_select)
         shifted = top - top.min() + 1e-6  # ensure strictly positive weights
         weights = shifted / shifted.sum()
-        return weights
+        return self.cap_weights(weights, self.cfg.max_position_weight)
+
+    @staticmethod
+    def cap_weights(weights: pd.Series, cap: float) -> pd.Series:
+        """Cap any single name at `cap`, spreading the excess pro-rata across the
+        names still below the cap. Falls back to equal weight if the cap can't
+        be met (fewer than 1/cap names)."""
+        if cap is None or cap >= 1 or len(weights) == 0:
+            return weights
+        if len(weights) * cap < 1.0:
+            return pd.Series(1.0 / len(weights), index=weights.index)
+        w = weights.astype(float).copy()
+        for _ in range(100):
+            over = w > cap + 1e-12
+            if not over.any():
+                break
+            excess = (w[over] - cap).sum()
+            w[over] = cap
+            under = w < cap - 1e-12
+            w[under] += excess * w[under] / w[under].sum()
+        return w / w.sum()
 
     def min_variance(self, returns: pd.DataFrame) -> pd.Series:
         """
@@ -958,6 +1004,9 @@ def run_pipeline(cfg: Config):
                     for d in sorted(selector.coverage_log)]
     fundamentals_log = ([[str(d.date()), *edgar.coverage_log[d]] for d in sorted(edgar.coverage_log)]
                         if edgar else [])
+    last_decision = decision_dates[-1]
+    latest_fundamentals = fundamentals_at(last_decision).copy()
+    latest_fundamentals.index.name = "ticker"
 
     return {
         "results": results,
@@ -968,6 +1017,8 @@ def run_pipeline(cfg: Config):
         "universe_log": universe_log,
         "fundamentals_source": cfg.fundamentals_source,
         "fundamentals_log": fundamentals_log,
+        "latest_fundamentals": latest_fundamentals,
+        "latest_decision_date": last_decision,
     }
 
 
@@ -1216,8 +1267,8 @@ full history from {CFG.start_date} to {CFG.end_date}.
 
 Every factor strategy follows the same two-step recipe: **(1) score every stock, (2) keep only
 the top {int(CFG.top_pct * 100)}% by score and size each position roughly in proportion to how
-much better its score is than the rest of that top group.** A stock that doesn't make the cut
-gets a 0% weight that month. Here's exactly what goes into each score:
+much better its score is than the rest of that top group, with no single stock above
+{int(CFG.max_position_weight * 100)}%.** A stock that doesn't make the cut gets a 0% weight that month. Here's exactly what goes into each score:
 
 - **Momentum score** — each stock's total return over the trailing 12 months, *skipping the
   most recent month* (a standard academic adjustment, since very recent moves tend to reverse
