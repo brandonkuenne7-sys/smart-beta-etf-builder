@@ -1,5 +1,8 @@
 name: Probe SEC EDGAR (temporary)
-on: workflow_dispatch
+on:
+  push:
+    branches: [pit-universe]
+    paths: [".github/workflows/probe_sec.yml"]
 jobs:
   probe:
     runs-on: ubuntu-latest
