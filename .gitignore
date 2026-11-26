@@ -5,3 +5,6 @@ __pycache__/
 venv/
 .env
 *.png
+*.tmp
+pipeline_cache.pkl
+.DS_Store

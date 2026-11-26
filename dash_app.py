@@ -74,6 +74,12 @@ if os.path.exists(CACHE_PATH):
     FF_DF_RAW = (pd.DataFrame(_cache["ff_attribution"]).set_index("Strategy")
                  if _cache["ff_attribution"] else pd.DataFrame())
     DATA_GENERATED_AT = _cache.get("generated_at", "unknown")
+
+    # Newer caches record the backtest window they were built for. Use it so
+    # the subtitle, Investment Memo and How It Works text describe the data
+    # actually on screen (older caches fall back to Config's dates).
+    CFG.start_date = _cache.get("start_date", CFG.start_date)
+    CFG.end_date = _cache.get("end_date", CFG.end_date)
 else:
     print("No pipeline_cache.json found — running pipeline live (needs internet access).")
     PIPELINE = run_pipeline(CFG)

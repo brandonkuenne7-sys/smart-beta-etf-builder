@@ -1,6 +1,8 @@
 # Smart Beta ETF Builder
 ### Designing, Backtesting, and Reporting on an Institutional-Grade Factor ETF
 
+**Live dashboard:** https://brandonkuenne7.pythonanywhere.com/ — data refreshes automatically each month.
+
 ---
 
 ## 1. Project Overview
@@ -282,6 +284,33 @@ as a live current-day snapshot via `yfinance`. To keep results stable across rer
 are cached to `/tmp/fundamentals_snapshot.csv` by default (`Config.use_cached_fundamentals =
 True`). Delete that file, or set the flag to `False`, whenever you want a fresh pull (e.g., to
 show the portfolio drift over time as a feature rather than a bug).
+
+---
+
+## 19. Automated Monthly Refresh
+
+The live site runs on PythonAnywhere's free tier, which can't reach Yahoo Finance. So the data is
+rebuilt on GitHub's servers and pushed into PythonAnywhere by
+`.github/workflows/refresh_data.yml`, on the 3rd of every month:
+
+1. `precompute_cache.py` reruns the full pipeline through the last completed month, using the
+   pinned stack in `requirements-refresh.txt`.
+2. `validate_cache.py` checks the result before anything is published: all seven strategies
+   present, no missing values, data is current, Sharpe/CAGR in a plausible range, latest
+   weights sum to 100%, Fama-French attribution complete. If any check fails, the run stops and
+   the live site keeps the previous month's data.
+3. The new `pipeline_cache.json` is committed, along with a gzipped snapshot in `history/`.
+   Those snapshots build a month-by-month, out-of-sample record of what each strategy held.
+4. The file is uploaded through the PythonAnywhere API, the web app is reloaded, and the
+   workflow confirms the live site is serving the new data.
+
+**One-time setup:** create an API token (PythonAnywhere → Account → API Token) and add it as a
+repository secret named `PA_API_TOKEN` (GitHub → Settings → Secrets and variables → Actions).
+
+**Run it manually:** Actions tab → *Monthly data refresh* → *Run workflow*.
+
+**Run it locally:** `pip install -r requirements-refresh.txt && python precompute_cache.py`
+(optionally `--end-date YYYY-MM-DD`), then `python validate_cache.py pipeline_cache.json`.
 
 ---
 
