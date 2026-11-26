@@ -8,3 +8,4 @@ scipy==1.13.1
 statsmodels==0.14.6
 pandas-datareader==0.10.0
 yfinance>=1.2.0,<2
+six  # pandas-datareader imports it but no longer gets it transitively

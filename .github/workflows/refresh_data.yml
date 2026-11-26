@@ -5,8 +5,8 @@
 # here on GitHub's servers and pushed INTO PythonAnywhere:
 #
 #   1. Rebuild pipeline_cache.json through the last completed month
-#   2. Validate it (validate_cache.py) — on failure, stop; the site keeps
-#      last month's data and GitHub emails you
+#   2. Validate it (validate_cache.py), retrying up to 3 times — if it still
+#      fails, stop; the site keeps last month's data and GitHub emails you
 #   3. Commit it, plus a gzipped monthly snapshot in history/
 #   4. Upload it to PythonAnywhere via their API and reload the site
 #   5. Confirm the live site is serving the new data
@@ -48,10 +48,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -60,17 +60,23 @@ jobs:
       - name: Install research stack
         run: pip install -r requirements-refresh.txt
 
-      - name: Rebuild cache (up to 3 attempts — Yahoo sometimes rate-limits)
+      - name: Rebuild and validate (up to 3 attempts)
+        # Yahoo occasionally rate-limits or returns blank fundamentals without
+        # erroring, so each attempt clears the engine's fundamentals snapshot
+        # and must pass validate_cache.py before anything is published.
         run: |
           for attempt in 1 2 3; do
-            if python precompute_cache.py --output /tmp/new_cache.json; then exit 0; fi
-            echo "Attempt $attempt failed; retrying after a pause"
-            sleep $((attempt * 120))
+            rm -f /tmp/fundamentals_snapshot.csv
+            if python precompute_cache.py --output /tmp/new_cache.json \
+               && python validate_cache.py /tmp/new_cache.json --previous pipeline_cache.json; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Attempt $attempt failed; retrying after a pause"
+              sleep $((attempt * 120))
+            fi
           done
           exit 1
-
-      - name: Validate before publishing
-        run: python validate_cache.py /tmp/new_cache.json --previous pipeline_cache.json
 
       - name: Diagnostics (only shown when something fails)
         if: failure()
