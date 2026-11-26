@@ -408,6 +408,24 @@ kpi_row = html.Div([
                else "vs. 1 benchmark"), delay_class="fade-in-5"),
 ], className="kpi-row")
 
+# ---- Author / project info (edit here) ----
+AUTHOR = {
+    "name": "Brandon Kuenne",
+    "bio": ("BSBA candidate at UNC Kenan-Flagler Business School (Class of 2028), minor in "
+            "Philosophy, Politics & Economics, interested in alternatives and buy-side investing."),
+    "summary": ("A rules-based factor research engine in Python: seven smart-beta strategies rebuilt "
+                "every month from point-in-time S&P 500 membership and SEC EDGAR filings, backtested "
+                "since 2015 against SPY with Fama-French attribution, and refreshed automatically "
+                "through GitHub Actions."),
+    "linkedin": "https://www.linkedin.com/in/bkuenne",
+    "github": "https://github.com/brandonkuenne7-sys/smart-beta-etf-builder",
+}
+
+
+def _ext_link(children, href, className):
+    return html.A(children, href=href, target="_blank", rel="noopener noreferrer", className=className)
+
+
 header = html.Div([
     html.Div([
         html.H1([html.I(className="bi bi-graph-up-arrow", style={"color": "#1652F0",
@@ -418,8 +436,15 @@ header = html.Div([
                                              if CFG.universe_mode == "pit" else "."),
                className="app-subtitle"),
     ]),
-    html.Div([html.Span(className="dot"), f" Data refreshed {DATA_GENERATED_AT}"],
-              className="app-meta-badge"),
+    html.Div([
+        html.Div([html.Span(className="dot"), f" Data refreshed {DATA_GENERATED_AT}"],
+                 className="app-meta-badge"),
+        html.Div([
+            "Built by ", html.Span(AUTHOR["name"], className="author-name"),
+            _ext_link(html.I(className="bi bi-linkedin"), AUTHOR["linkedin"], "author-icon"),
+            _ext_link(html.I(className="bi bi-github"), AUTHOR["github"], "author-icon"),
+        ], className="author-byline"),
+    ], className="app-header-right"),
 ], className="app-header fade-in")
 
 
@@ -735,10 +760,19 @@ tabs = dbc.Tabs([
     dbc.Tab(memo_tab, label="Investment Memo", tab_id="tab-memo"),
 ], id="main-tabs", active_tab="tab-performance", className="custom-tabs")
 
-footer = html.Div(
-    "This is a research prototype for educational purposes — not investment advice.",
-    style={"textAlign": "center", "color": "var(--text-muted)", "fontSize": "12px", "marginTop": "40px"},
-)
+footer = html.Div([
+    html.Div([
+        html.Div("About this project", className="section-title"),
+        html.P(AUTHOR["summary"], className="about-summary"),
+        html.P([html.B(AUTHOR["name"]), " — ", AUTHOR["bio"]], className="about-bio"),
+        html.Div([
+            _ext_link([html.I(className="bi bi-linkedin"), " LinkedIn"], AUTHOR["linkedin"], "about-btn about-btn-primary"),
+            _ext_link([html.I(className="bi bi-github"), " Source code"], AUTHOR["github"], "about-btn"),
+        ], className="about-actions"),
+    ], className="section-card about-card"),
+    html.Div("This is a research prototype for educational purposes — not investment advice.",
+             className="footer-disclaimer"),
+])
 
 app.layout = html.Div(html.Div([header, kpi_row, tabs, footer], className="app-shell"))
 
