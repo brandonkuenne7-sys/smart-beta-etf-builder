@@ -309,6 +309,11 @@ repository secret named `PA_API_TOKEN` (GitHub → Settings → Secrets and vari
 
 **Run it manually:** Actions tab → *Monthly data refresh* → *Run workflow*.
 
+**Deploying code changes:** after changing `dash_app.py`, `assets/style.css` or the engine, run
+*Deploy dashboard code* from the Actions tab. It smoke-tests the app against the server's Dash
+versions, backs up the live files to `mysite/backups/<timestamp>/`, uploads, reloads, and checks the
+site.
+
 **Run it locally:** `pip install -r requirements-refresh.txt && python precompute_cache.py`
 (optionally `--end-date YYYY-MM-DD`), then `python validate_cache.py pipeline_cache.json`.
 

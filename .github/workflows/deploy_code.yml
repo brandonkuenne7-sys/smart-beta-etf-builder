@@ -1,0 +1,96 @@
+# =============================================================================
+# Deploy dashboard code → PythonAnywhere (manual)
+#
+# Uploads dash_app.py, smart_beta_etf_builder.py and assets/style.css from
+# this repo to /home/<user>/mysite, then reloads the site. Run it from the
+# Actions tab after merging a frontend change ("Run workflow").
+#
+#   1. Smoke-test the app against the server's Dash versions
+#   2. Back up the files currently live to mysite/backups/<timestamp>/
+#   3. Upload the new files and reload the web app
+#   4. Confirm the live site responds and still serves the current data
+#
+# Uses the same PA_API_TOKEN secret as the monthly data refresh.
+# =============================================================================
+
+name: Deploy dashboard code
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pythonanywhere-deploy
+  cancel-in-progress: false
+
+env:
+  PA_USER: brandonkuenne7
+  PA_DOMAIN: brandonkuenne7.pythonanywhere.com
+  FILES: "dash_app.py smart_beta_etf_builder.py assets/style.css"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"   # matches the PythonAnywhere web app
+
+      - name: Smoke-test against the server's Dash versions
+        run: |
+          pip install "dash==4.4.0" "dash-bootstrap-components==2.0.4" pandas plotly
+          python - <<'EOF'
+          import dash_app
+          r = dash_app.app.server.test_client().get("/_dash-layout")
+          assert r.status_code == 200, r.status_code
+          print("Layout OK,", len(r.data), "bytes")
+          EOF
+
+      - name: Back up live files, upload new ones, reload
+        env:
+          PA_API_TOKEN: ${{ secrets.PA_API_TOKEN }}
+        run: |
+          test -n "$PA_API_TOKEN" || { echo "::error::PA_API_TOKEN secret not set"; exit 1; }
+          api="https://www.pythonanywhere.com/api/v0/user/${PA_USER}"
+          site="/home/${PA_USER}/mysite"
+          stamp=$(date -u +%Y%m%d-%H%M%S)
+          auth=(-H "Authorization: Token ${PA_API_TOKEN}")
+
+          for f in $FILES; do
+            name=$(basename "$f")
+            curl --fail-with-body -sS "${auth[@]}" -o "/tmp/live_${name}" "${api}/files/path${site}/${f}"
+            curl --fail-with-body -sS -X POST "${auth[@]}" -F "content=@/tmp/live_${name}" \
+              "${api}/files/path${site}/backups/${stamp}/${name}" > /dev/null
+            echo "Backed up ${f} -> backups/${stamp}/${name}"
+          done
+
+          for f in $FILES; do
+            curl --fail-with-body -sS -X POST "${auth[@]}" -F "content=@${f}" \
+              "${api}/files/path${site}/${f}" > /dev/null
+            echo "Uploaded ${f}"
+          done
+
+          curl --fail-with-body -sS -X POST "${auth[@]}" "${api}/webapps/${PA_DOMAIN}/reload/"
+          echo
+          echo "BACKUP_DIR=backups/${stamp}" >> "$GITHUB_ENV"
+
+      - name: Confirm live site
+        run: |
+          expected=$(python -c "import json; print(json.load(open('pipeline_cache.json'))['generated_at'])")
+          for i in 1 2 3 4 5 6; do
+            body=$(curl -sS "https://${PA_DOMAIN}/_dash-layout" || true)
+            if echo "$body" | grep -qF "$expected"; then
+              echo "Live site OK (data generated ${expected}). Previous files saved in mysite/${BACKUP_DIR}."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::Site did not come back with the expected data. Restore from mysite/${BACKUP_DIR} if needed."
+          exit 1
