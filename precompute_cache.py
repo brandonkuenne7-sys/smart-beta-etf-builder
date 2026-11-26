@@ -16,6 +16,12 @@
 #   --end-date YYYY-MM-DD or the REFRESH_END_DATE environment variable.
 #   The window is written into the cache so the dashboard can label it.
 #
+# Universe:
+#   The main run uses the point-in-time S&P 500 universe (Config.universe_mode
+#   = "pit"). A second "hindsight" run on the original fixed 30-stock list is
+#   saved alongside it so the dashboard can show how much that list inflated
+#   results.
+#
 # JSON (not pickle) is used deliberately: pickle files embed the exact numpy/
 # pandas internal object format they were created with, so a cache made on
 # numpy 2.x can fail to load on a server running numpy 1.x. JSON is plain
@@ -23,6 +29,7 @@
 # =============================================================================
 
 import argparse
+import dataclasses
 import json
 import os
 from datetime import datetime, timezone
@@ -58,6 +65,10 @@ def main():
     print("Running full pipeline (requires internet access to Yahoo Finance) ...")
     pipeline_output = run_pipeline(CFG)
 
+    print("Running hindsight comparison on the original fixed 30-stock universe ...")
+    hindsight_cfg = dataclasses.replace(CFG, universe_mode="fixed")
+    hindsight_output = run_pipeline(hindsight_cfg)
+
     print("Running Fama-French attribution (requires internet access) ...")
     try:
         ff_df = FamaFrenchAnalytics(CFG).run_all(pipeline_output["results"], model="FF5")
@@ -86,6 +97,20 @@ def main():
         "start_date": CFG.start_date,
         "end_date": CFG.end_date,
         "data_through": str(benchmark.index.max().date()),
+        "universe": {
+            "mode": pipeline_output["universe_mode"],
+            "top_n": CFG.pit_top_n,
+            "liquidity_lookback_days": CFG.liquidity_lookback,
+            # [rebalance date, S&P 500 members, members with price data, selected]
+            "log": pipeline_output["universe_log"],
+        },
+        "comparison": {
+            "label": f"Hindsight universe (fixed {len(CFG.universe)} stocks)",
+            "results": {
+                name: {"equity_curve": _series_to_pairs(res["equity_curve"])}
+                for name, res in hindsight_output["results"].items()
+            },
+        },
     }
 
     # Write to a temp file first so a crash mid-write never leaves a

@@ -21,6 +21,8 @@ MIN_TRADING_DAYS = 2000          # ~8 years; the backtest starts in 2015
 MAX_STALENESS_DAYS = 10          # last price vs. the (exclusive) end date
 SHARPE_RANGE = (-2.0, 4.0)       # anything outside this is almost certainly a data error
 CAGR_RANGE = (-0.5, 1.0)
+MIN_PRICE_COVERAGE = 0.80        # avg share of S&P 500 members with usable price data
+MIN_FULL_UNIVERSE_SHARE = 0.95   # share of rebalances that fill the full top-N universe
 
 
 def _day(s: str) -> date:
@@ -88,6 +90,29 @@ def validate(cache: dict, previous: dict | None) -> list[str]:
     ff = cache["ff_attribution"]
     if len(ff) != len(EXPECTED_STRATEGIES):
         errors.append(f"Fama-French attribution has {len(ff)} rows, expected {len(EXPECTED_STRATEGIES)}")
+
+    universe = cache.get("universe")
+    if universe and universe.get("mode") == "pit":
+        log = universe.get("log") or []
+        if not log:
+            errors.append("point-in-time universe log is empty")
+        else:
+            coverage = sum(r[2] / r[1] for r in log if r[1]) / len(log)
+            full = sum(1 for r in log if r[3] >= universe["top_n"]) / len(log)
+            if coverage < MIN_PRICE_COVERAGE:
+                errors.append(f"only {coverage:.0%} of S&P 500 members had price data on average")
+            if full < MIN_FULL_UNIVERSE_SHARE:
+                errors.append(f"only {full:.0%} of rebalances filled the top-{universe['top_n']} universe")
+
+    comparison = cache.get("comparison")
+    if universe and universe.get("mode") == "pit":
+        comp = (comparison or {}).get("results", {})
+        if set(comp) != EXPECTED_STRATEGIES:
+            errors.append("hindsight comparison run is missing or incomplete")
+        for name, res in comp.items():
+            pairs = res.get("equity_curve", [])
+            if len(pairs) < MIN_TRADING_DAYS or not all(math.isfinite(v) and v > 0 for _, v in pairs):
+                errors.append(f"hindsight comparison: {name} curve is short or invalid")
 
     if previous:
         prev_last = _day(previous["benchmark_curve"][-1][0])

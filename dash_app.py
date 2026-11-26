@@ -81,6 +81,15 @@ if os.path.exists(CACHE_PATH):
     # actually on screen (older caches fall back to Config's dates).
     CFG.start_date = _cache.get("start_date", CFG.start_date)
     CFG.end_date = _cache.get("end_date", CFG.end_date)
+
+    # Which universe produced this cache (older caches = the fixed 30-stock list).
+    UNIVERSE_INFO = _cache.get("universe") or {"mode": "fixed"}
+    CFG.universe_mode = UNIVERSE_INFO.get("mode", "fixed")
+    CFG.pit_top_n = UNIVERSE_INFO.get("top_n", CFG.pit_top_n)
+    _comparison = _cache.get("comparison") or {}
+    COMPARISON_LABEL = _comparison.get("label", "Hindsight universe")
+    COMPARISON_CURVES = {name: _pairs_to_series(r["equity_curve"])
+                         for name, r in (_comparison.get("results") or {}).items()}
 else:
     print("No pipeline_cache.json found — running pipeline live (needs internet access).")
     PIPELINE = run_pipeline(CFG)
@@ -91,6 +100,9 @@ else:
         FF_DF_RAW = pd.DataFrame()
     from datetime import datetime, timezone
     DATA_GENERATED_AT = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + " (live run)"
+    UNIVERSE_INFO = {"mode": CFG.universe_mode, "top_n": CFG.pit_top_n,
+                     "log": PIPELINE.get("universe_log", [])}
+    COMPARISON_LABEL, COMPARISON_CURVES = "Hindsight universe", {}
 
 ANALYTICS = PerformanceAnalytics(CFG)
 STRATEGY_NAMES = list(PIPELINE["results"].keys())
@@ -153,7 +165,7 @@ for _factor, _desc in FACTOR_DEFINITIONS.items():
 # top holdings (pulled from the real backtest weight history, not a mockup).
 STRATEGY_EXPLANATIONS = {
     "Equal Weight": {
-        "formula": f"weight = 1 ÷ {len(CFG.universe)} for every stock",
+        "formula": f"weight = 1 ÷ {CFG.pit_top_n if CFG.universe_mode == 'pit' else len(CFG.universe)} for every stock",
         "description": "No scoring at all. Every stock in the universe gets the exact same "
                         "slice of the portfolio, rebalanced back to equal shares every month. "
                         "This is the simplest possible baseline — useful for seeing whether "
@@ -392,7 +404,8 @@ kpi_row = html.Div([
     _kpi_card("bi-bar-chart-line", "SPY Benchmark Sharpe", f"{_spy_sharpe:.2f}",
               "S&P 500 buy-and-hold", delay_class="fade-in-4"),
     _kpi_card("bi-clock-history", "Strategies Tracked", str(len(STRATEGY_NAMES)),
-              "vs. 1 benchmark", delay_class="fade-in-5"),
+              (f"Top {CFG.pit_top_n} point-in-time S&P 500" if CFG.universe_mode == "pit"
+               else "vs. 1 benchmark"), delay_class="fade-in-5"),
 ], className="kpi-row")
 
 header = html.Div([
@@ -401,7 +414,9 @@ header = html.Div([
                                                                    "marginRight": "10px"}),
                  "Smart Beta ETF Builder"], className="app-title"),
         html.P(f"Institutional-style factor ETF research — backtested {CFG.start_date} to "
-               f"{CFG.end_date} vs. SPY.", className="app-subtitle"),
+               f"{CFG.end_date} vs. SPY" + (f", on a point-in-time S&P 500 universe."
+                                             if CFG.universe_mode == "pit" else "."),
+               className="app-subtitle"),
     ]),
     html.Div([html.Span(className="dot"), f" Data refreshed {DATA_GENERATED_AT}"],
               className="app-meta-badge"),
@@ -442,6 +457,58 @@ def _build_alpha_figure():
 
 
 CORR_FIGURE = _build_correlation_figure()
+
+
+# ---- Hindsight-bias check: point-in-time universe vs. the original fixed list ----
+def _build_bias_table():
+    rows = []
+    for name in STRATEGY_NAMES:
+        if name not in COMPARISON_CURVES:
+            continue
+        pit = ANALYTICS.compute_metrics(PIPELINE["results"][name]["equity_curve"], BENCH_CURVE)
+        hind = ANALYTICS.compute_metrics(COMPARISON_CURVES[name], BENCH_CURVE)
+        rows.append({
+            "Strategy": name,
+            "CAGR (point-in-time)": pit["CAGR"],
+            "CAGR (hindsight list)": hind["CAGR"],
+            "Inflation from hindsight": hind["CAGR"] - pit["CAGR"],
+            "Sharpe (point-in-time)": pit["Sharpe"],
+            "Sharpe (hindsight list)": hind["Sharpe"],
+        })
+    return pd.DataFrame(rows)
+
+
+def _build_bias_figure(df):
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["Strategy"], y=df["CAGR (hindsight list)"], name=COMPARISON_LABEL,
+                         marker_color="#D6D9E0",
+                         text=[f"{v:.1%}" for v in df["CAGR (hindsight list)"]], textposition="outside"))
+    fig.add_trace(go.Bar(x=df["Strategy"], y=df["CAGR (point-in-time)"],
+                         name=f"Point-in-time top {CFG.pit_top_n} S&P 500", marker_color="#1652F0",
+                         text=[f"{v:.1%}" for v in df["CAGR (point-in-time)"]], textposition="outside"))
+    spy_cagr = ANALYTICS.compute_metrics(BENCH_CURVE)["CAGR"]
+    fig.add_hline(y=spy_cagr, line_dash="dash", line_color="#10151F",
+                  annotation_text=f"SPY {spy_cagr:.1%}", annotation_position="top left")
+    fig.update_layout(barmode="group", template="plotly_white", height=400, font=PLOTLY_FONT,
+                      yaxis_tickformat=".0%", yaxis_title="CAGR",
+                      margin=dict(l=50, r=20, t=30, b=60), plot_bgcolor="white", paper_bgcolor="white",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+    return fig
+
+
+def _universe_coverage_text():
+    log = UNIVERSE_INFO.get("log") or []
+    if not log:
+        return ""
+    members = sum(r[1] for r in log) / len(log)
+    priced = sum(r[2] / r[1] for r in log if r[1]) / len(log)
+    return (f"Each month the universe is the {CFG.pit_top_n} most-traded stocks among that month's "
+            f"S&P 500 members (~{members:.0f} names). On average {priced:.0%} of members had usable "
+            f"free price data; the rest are mostly acquired or delisted companies, so a little "
+            f"survivorship bias remains.")
+
+
+BIAS_DF = _build_bias_table() if COMPARISON_CURVES else pd.DataFrame()
 
 
 def _build_education_accordion():
@@ -496,6 +563,34 @@ performance_tab = html.Div([
         ], className="mb-3", justify="start"),
         dcc.Loading(dcc.Graph(id="main-chart", config=CHART_CONFIG), type="circle", color="#1652F0"),
     ], className="section-card"),
+
+    (html.Div([
+        html.Div("Hindsight-Bias Check", className="section-title"),
+        html.P(["The same seven strategies run twice: once on the ", html.B("original fixed list"),
+                " of 30 companies chosen in 2026 (today's winners, picked with hindsight), and once on a ",
+                html.B("point-in-time universe"), " built each month from that date's S&P 500 members. ",
+                "The gap is how much hindsight flattered the original results."],
+               className="section-desc"),
+        dcc.Graph(figure=_build_bias_figure(BIAS_DF), config=CHART_CONFIG),
+        dash_table.DataTable(
+            id="bias-table",
+            columns=_table_columns(BIAS_DF.columns, pct_cols={
+                "CAGR (point-in-time)", "CAGR (hindsight list)", "Inflation from hindsight"}),
+            data=BIAS_DF.to_dict("records"),
+            style_cell={"padding": "10px 14px", "fontFamily": "Inter, Arial", "fontSize": 13,
+                        "minWidth": "110px"},
+            style_cell_conditional=_STRATEGY_COL_LEFT,
+            style_data_conditional=[
+                {"if": {"column_id": "Inflation from hindsight", "filter_query": "{Inflation from hindsight} > 0"},
+                 "color": "var(--negative)", "fontWeight": 600},
+            ],
+            style_table={"overflowX": "auto"},
+            style_as_list_view=True,
+            sort_action="native",
+        ),
+        html.P(_universe_coverage_text(), className="section-desc",
+               style={"marginTop": "14px", "marginBottom": 0}),
+    ], className="section-card") if not BIAS_DF.empty else html.Div()),
 
     dbc.Accordion([
         dbc.AccordionItem(
@@ -742,8 +837,11 @@ def update_allocation_chart(strategy, view_type, selected_date):
         ))
         fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
     else:
+        if len(weights) > 15:   # keep the donut readable for 25-50 holdings
+            weights = pd.concat([weights.head(15),
+                                 pd.Series({f"Other ({len(weights) - 15})": weights.iloc[15:].sum()})])
         fig = go.Figure(data=[go.Pie(
-            labels=weights.index, values=weights.values, hole=0.45,
+            labels=weights.index, values=weights.values, hole=0.45, sort=False,
             marker=dict(line=dict(color="white", width=2)),
             hovertemplate="%{label}: %{value:.1%}<extra></extra>",
         )])

@@ -319,5 +319,29 @@ site.
 
 ---
 
+## 20. Point-in-Time Universe (Hindsight-Bias Fix)
+
+The original universe was a fixed list of 30 large caps chosen in 2026, which quietly bakes
+hindsight into the backtest (it includes NVIDIA, Broadcom, Tesla, etc., because we now know they
+won). The engine now defaults to `Config.universe_mode = "pit"`:
+
+- **Membership:** `data/sp500_membership.csv.gz`, every S&P 500 composition change since 2012
+  (from [fja05680/sp500](https://github.com/fja05680/sp500); refreshed by
+  `scripts/update_membership.py` at the start of each monthly run).
+- **Selection:** at each month-end, take that date's members with ~13 months of price history,
+  rank by trailing 3-month average dollar volume, keep the top 50 (`Config.pit_top_n`).
+- **Scoring:** every factor is computed cross-sectionally within that month's universe.
+- **Comparison:** `precompute_cache.py` also runs the original fixed list
+  (`universe_mode="fixed"`); the dashboard's *Hindsight-Bias Check* shows both.
+
+Backtest timing was tightened at the same time: rebalances happen on the last **trading** day of
+each month, new weights start earning the **next** day (no same-day look-ahead), and price history
+before `start_date` is used only for factor lookbacks, so every strategy is invested from day one.
+
+**Known remaining biases:** free price data is missing for some delisted/acquired members, and
+fundamentals are a current snapshot rather than point-in-time.
+
+---
+
 *See `smart_beta_etf_builder.py` for the complete, runnable implementation (Colab-cell-structured)
 and `dash_app.py` for the interactive dashboard.*

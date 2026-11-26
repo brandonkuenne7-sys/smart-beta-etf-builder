@@ -22,6 +22,7 @@
 !pip install -q yfinance pandas numpy scipy matplotlib seaborn plotly quantstats
 """
 
+import os
 import warnings
 import traceback
 from dataclasses import dataclass, field
@@ -89,6 +90,22 @@ class Config:
     ])
     benchmark: str = "SPY"
 
+    # Universe mode:
+    #   "pit"   — point-in-time S&P 500. At each rebalance, the `pit_top_n` most
+    #             liquid stocks (trailing average dollar volume) among the
+    #             index's members ON THAT DATE. No hindsight in stock selection.
+    #   "fixed" — the hardcoded `universe` list above (the original approach).
+    #             Kept as a comparison run to measure how much picking today's
+    #             winners in hindsight inflates results.
+    universe_mode: str = "pit"
+    pit_top_n: int = 50
+    liquidity_lookback: int = 63           # trading days of dollar volume for the liquidity rank
+    min_history_coverage: float = 0.95     # share of the factor lookback a stock needs prices for
+    membership_path: str = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "data", "sp500_membership.csv.gz")
+    history_buffer_days: int = 420         # extra calendar days of prices before start_date so
+                                           # factor lookbacks are full from the first rebalance
+
     start_date: str = "2015-01-01"
     end_date: str = "2026-01-01"
 
@@ -124,11 +141,13 @@ class DataPipeline:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    def get_prices(self) -> pd.DataFrame:
+    def get_prices(self, tickers: Optional[list] = None, with_volume: bool = False,
+                   batch_size: int = 100):
         """
-        Batch-download adjusted close prices for the universe + benchmark.
-        A single batched call is far faster and less rate-limit-prone than
-        looping per ticker.
+        Download adjusted close prices (and optionally volume) for `tickers`
+        (default: the fixed universe + benchmark), in batches. Prices start
+        `history_buffer_days` before start_date so momentum / volatility
+        lookbacks are already full on the first rebalance.
         """
         if yf is None:
             raise ImportError(
@@ -137,40 +156,49 @@ class DataPipeline:
                 "The deployed dashboard shouldn't hit this path since it reads from "
                 "pipeline_cache.json instead."
             )
-        tickers = list(dict.fromkeys(self.cfg.universe + [self.cfg.benchmark]))
+        if tickers is None:
+            tickers = list(dict.fromkeys(self.cfg.universe + [self.cfg.benchmark]))
+        start = (pd.Timestamp(self.cfg.start_date)
+                 - pd.Timedelta(days=self.cfg.history_buffer_days)).strftime("%Y-%m-%d")
         print(f"Downloading price history for {len(tickers)} tickers "
-              f"({self.cfg.start_date} -> {self.cfg.end_date}) ...")
-        try:
-            raw = yf.download(
-                tickers,
-                start=self.cfg.start_date,
-                end=self.cfg.end_date,
-                auto_adjust=True,   # adjusted close folded into 'Close'
-                progress=False,
-                group_by="ticker",
-                threads=True,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Price download failed: {e}") from e
+              f"({start} -> {self.cfg.end_date}, incl. lookback buffer) ...")
 
-        prices = pd.DataFrame()
-        for t in tickers:
+        closes, volumes, missing = {}, {}, []
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i + batch_size]
             try:
-                if isinstance(raw.columns, pd.MultiIndex):
-                    series = raw[t]["Close"]
-                else:
-                    series = raw["Close"]  # single-ticker edge case
-                prices[t] = series
-            except (KeyError, Exception):
-                print(f"  [warn] no price data returned for {t}, skipping.")
+                raw = yf.download(
+                    batch, start=start, end=self.cfg.end_date,
+                    auto_adjust=True,   # adjusted close folded into 'Close'
+                    progress=False, group_by="ticker", threads=True,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Price download failed: {e}") from e
+            for t in batch:
+                try:
+                    sub = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+                    close = sub["Close"]
+                    if close.notna().sum() == 0:
+                        raise KeyError(t)
+                    closes[t] = close
+                    volumes[t] = sub["Volume"]
+                except Exception:
+                    missing.append(t)
 
-        prices = prices.sort_index()
-        prices = prices.dropna(axis=1, how="all")
+        if missing:
+            preview = ", ".join(sorted(missing)[:15])
+            more = f" (+{len(missing) - 15} more)" if len(missing) > 15 else ""
+            print(f"  [warn] no price data for {len(missing)} tickers "
+                  f"(typically delisted/acquired): {preview}{more}")
+
+        prices = pd.DataFrame(closes).sort_index().dropna(axis=1, how="all")
+        volume = pd.DataFrame(volumes).sort_index().reindex(columns=prices.columns)
         print(f"Retrieved prices for {prices.shape[1]} tickers, "
               f"{prices.shape[0]} trading days.")
-        return prices
+        return (prices, volume) if with_volume else prices
 
-    def get_fundamentals(self) -> pd.DataFrame:
+    def get_fundamentals(self, tickers: Optional[list] = None,
+                         cache_path: Optional[str] = None) -> pd.DataFrame:
         """
         Best-effort fundamentals snapshot via yfinance `.info`.
         NOTE: this is a CURRENT snapshot, not point-in-time history, which
@@ -184,14 +212,15 @@ class DataPipeline:
         different day. Delete the cache file (or set the flag to False) to
         force a fresh pull.
         """
-        import os
-        if self.cfg.use_cached_fundamentals and os.path.exists(self.cfg.fundamentals_cache_path):
-            cached = pd.read_csv(self.cfg.fundamentals_cache_path, index_col="ticker")
-            if set(self.cfg.universe).issubset(set(cached.index)):
+        tickers = list(tickers) if tickers is not None else list(self.cfg.universe)
+        cache_path = cache_path or self.cfg.fundamentals_cache_path
+        if self.cfg.use_cached_fundamentals and os.path.exists(cache_path):
+            cached = pd.read_csv(cache_path, index_col="ticker")
+            if set(tickers).issubset(set(cached.index)):
                 print(f"Loaded cached fundamentals snapshot from "
-                      f"{self.cfg.fundamentals_cache_path} (delete this file, or set "
+                      f"{cache_path} (delete this file, or set "
                       f"use_cached_fundamentals=False, to refresh).")
-                return cached.reindex(self.cfg.universe)
+                return cached.reindex(tickers)
 
         records = []
         if yf is None:
@@ -200,8 +229,8 @@ class DataPipeline:
                 "Run `pip install yfinance` in the environment where you run "
                 "precompute_cache.py."
             )
-        print(f"Pulling fundamentals for {len(self.cfg.universe)} tickers ...")
-        for t in self.cfg.universe:
+        print(f"Pulling fundamentals for {len(tickers)} tickers ...")
+        for t in tickers:
             try:
                 info = yf.Ticker(t).info
                 records.append({
@@ -218,10 +247,76 @@ class DataPipeline:
         fdf = pd.DataFrame(records).set_index("ticker")
 
         if self.cfg.use_cached_fundamentals:
-            fdf.to_csv(self.cfg.fundamentals_cache_path)
-            print(f"Cached fundamentals snapshot to {self.cfg.fundamentals_cache_path}")
+            fdf.to_csv(cache_path)
+            print(f"Cached fundamentals snapshot to {cache_path}")
 
         return fdf
+
+
+def load_sp500_membership(path: str) -> pd.Series:
+    """
+    Historical S&P 500 membership, one row per date the index changed
+    (source: github.com/fja05680/sp500). Returns a Series indexed by date
+    whose values are frozensets of tickers in Yahoo format (BRK.B -> BRK-B).
+    """
+    df = pd.read_csv(path, parse_dates=["date"]).sort_values("date")
+    return pd.Series(
+        [frozenset(t.strip().replace(".", "-") for t in row.split(",") if t.strip())
+         for row in df["tickers"]],
+        index=pd.DatetimeIndex(df["date"]),
+    )
+
+
+class UniverseSelector:
+    """
+    Decides which stocks are investable on a given date, using only
+    information available on that date.
+
+    fixed mode: every stock in the (pre-cleaned) fixed universe.
+    pit mode:   S&P 500 members as of that date, with enough price history for
+                the factor lookbacks, ranked by trailing average dollar volume;
+                the top `pit_top_n` are kept.
+    """
+
+    def __init__(self, cfg: Config, prices: pd.DataFrame,
+                 volume: Optional[pd.DataFrame] = None,
+                 membership: Optional[pd.Series] = None):
+        self.cfg = cfg
+        self.prices = prices
+        self.membership = membership
+        need = cfg.momentum_lookback + cfg.momentum_skip
+        self._coverage = prices.notna().rolling(need, min_periods=1).mean()
+        self._dollar_vol = None
+        if volume is not None:
+            self._dollar_vol = (prices * volume).rolling(
+                cfg.liquidity_lookback, min_periods=int(cfg.liquidity_lookback * 0.8)).mean()
+        self._cache = {}
+        self.coverage_log = {}   # date -> [index members, members with prices, selected]
+
+    def members_at(self, date: pd.Timestamp) -> frozenset:
+        i = self.membership.index.searchsorted(date, side="right") - 1
+        return self.membership.iloc[i] if i >= 0 else frozenset()
+
+    def eligible(self, date: pd.Timestamp) -> list:
+        if date in self._cache:
+            return self._cache[date]
+        has_price = self.prices.loc[date].notna()
+        has_history = self._coverage.loc[date] >= self.cfg.min_history_coverage
+        usable = has_price & has_history
+
+        if self.cfg.universe_mode == "pit":
+            members = self.members_at(date)
+            in_panel = [t for t in members if t in self.prices.columns]
+            priced = [t for t in in_panel if has_price[t]]
+            candidates = [t for t in in_panel if usable[t]]
+            dv = self._dollar_vol.loc[date, candidates].dropna().sort_values(ascending=False)
+            names = sorted(dv.index[: self.cfg.pit_top_n])
+            self.coverage_log[date] = [len(members), len(priced), len(names)]
+        else:
+            names = [t for t in self.prices.columns if usable[t]]
+
+        self._cache[date] = names
+        return names
 
 
 # %% CELL 4 — Data Cleaning
@@ -367,15 +462,48 @@ class Backtester:
     """
     Simulates monthly rebalancing for a given weighting strategy, applying
     transaction costs proportional to one-way turnover.
+
+    Timing (no look-ahead):
+      - Weights are decided at the CLOSE of a rebalance date, using data up to
+        and including that date, and start earning returns on the NEXT trading day.
+      - Rebalance dates are the last TRADING day of each month.
+      - The initial portfolio is formed at the close of the last trading day
+        before start_date, so every strategy is invested from day one (the
+        price history before start_date is only used for factor lookbacks).
     """
 
     def __init__(self, cfg: Config, prices: pd.DataFrame):
         self.cfg = cfg
         self.prices = prices
-        self.daily_returns = prices.pct_change().dropna(how="all")
+        self.daily_returns = prices.pct_change(fill_method=None)
+        start = pd.Timestamp(cfg.start_date)
+        self.sim_index = self.daily_returns.index[self.daily_returns.index >= start]
+        if len(self.sim_index) == 0:
+            raise ValueError("No price data on or after start_date.")
+        before = prices.index[prices.index < self.sim_index[0]]
+        self.formation_date = before[-1] if len(before) else self.sim_index[0]
 
-    def _rebalance_dates(self) -> pd.DatetimeIndex:
-        return self.prices.resample(self.cfg.rebalance_freq).last().index
+    def rebalance_dates(self) -> pd.DatetimeIndex:
+        idx = self.sim_index
+        month_ends = idx.to_series().groupby(idx.to_period("M")).max()
+        return pd.DatetimeIndex(month_ends.values)
+
+    @staticmethod
+    def _turnover(new: pd.Series, old: pd.Series) -> float:
+        names = new.index.union(old.index)
+        return float((new.reindex(names, fill_value=0) - old.reindex(names, fill_value=0)).abs().sum() / 2.0)
+
+    def _safe_weights(self, weight_func, date, current: pd.Series, name: str) -> pd.Series:
+        try:
+            w = weight_func(date)
+            w = w[w.index.isin(self.prices.columns)].astype(float)
+            w = w[w > 0]
+            if w.sum() <= 0:
+                raise ValueError("no positive weights")
+            return w / w.sum()
+        except Exception as e:
+            print(f"  [warn] {name}: weight_func failed on {date.date()}: {e} — keeping prior weights")
+            return current
 
     def run(self, weight_func, name: str) -> dict:
         """
@@ -383,45 +511,33 @@ class Backtester:
         Runs the full historical simulation and returns equity curve, weight
         history, and turnover history.
         """
-        rebal_dates = self._rebalance_dates()
-        equity_curve = pd.Series(index=self.daily_returns.index, dtype=float)
-        equity_curve.iloc[0] = 1.0
-
-        current_weights = pd.Series(dtype=float)
-        weight_history = {}
-        turnover_history = {}
+        rebal = set(self.rebalance_dates())
+        weight_history, turnover_history = {}, {}
+        current = pd.Series(dtype=float)
         portfolio_value = 1.0
 
-        for i in range(len(self.daily_returns)):
-            date = self.daily_returns.index[i]
+        def rebalance(date):
+            nonlocal current, portfolio_value
+            new = self._safe_weights(weight_func, date, current, name)
+            turnover = self._turnover(new, current)
+            portfolio_value *= 1 - turnover * (self.cfg.transaction_cost_bps / 10000.0)
+            current = new
+            weight_history[date] = new
+            turnover_history[date] = turnover
 
-            if date in rebal_dates or i == 0:
-                try:
-                    new_weights = weight_func(date)
-                    new_weights = new_weights[new_weights.index.isin(self.prices.columns)]
-                    new_weights = new_weights / new_weights.sum() if new_weights.sum() > 0 else new_weights
-                except Exception as e:
-                    print(f"  [warn] {name}: weight_func failed on {date.date()}: {e}")
-                    new_weights = current_weights if len(current_weights) else self.prices.columns.to_series().apply(lambda x: 0)
-
-                turnover = (new_weights.reindex(new_weights.index.union(current_weights.index), fill_value=0)
-                            - current_weights.reindex(new_weights.index.union(current_weights.index), fill_value=0)
-                            ).abs().sum() / 2.0
-                cost = turnover * (self.cfg.transaction_cost_bps / 10000.0)
-                portfolio_value *= (1 - cost)
-
-                current_weights = new_weights
-                weight_history[date] = current_weights
-                turnover_history[date] = turnover
-
-            day_ret = self.daily_returns.loc[date, current_weights.index].fillna(0.0)
-            portfolio_ret = (day_ret * current_weights).sum()
-            portfolio_value *= (1 + portfolio_ret)
-            equity_curve.loc[date] = portfolio_value
+        rebalance(self.formation_date)
+        values = []
+        for date in self.sim_index:
+            if len(current):
+                day_ret = self.daily_returns.loc[date, current.index].fillna(0.0)
+                portfolio_value *= 1 + float((day_ret * current).sum())
+            values.append(portfolio_value)
+            if date in rebal:
+                rebalance(date)   # decided at today's close, earns from tomorrow
 
         return {
             "name": name,
-            "equity_curve": equity_curve.dropna(),
+            "equity_curve": pd.Series(values, index=self.sim_index),
             "weight_history": weight_history,
             "turnover_history": pd.Series(turnover_history),
         }
@@ -491,78 +607,106 @@ def run_pipeline(cfg: Config):
     cleaner = DataCleaner(cfg)
     factors = FactorEngine(cfg)
     constructor = PortfolioConstructor(cfg)
+    bench = cfg.benchmark
 
-    raw_prices = pipeline.get_prices()
-    fundamentals = pipeline.get_fundamentals()
-
-    benchmark_prices = raw_prices[cfg.benchmark].dropna()
-    universe_prices = cleaner.clean_prices(raw_prices.drop(columns=[cfg.benchmark]))
-    fundamentals = fundamentals.reindex(universe_prices.columns)
+    if cfg.universe_mode == "pit":
+        membership = load_sp500_membership(cfg.membership_path)
+        first = pd.Timestamp(cfg.start_date) - pd.Timedelta(days=cfg.history_buffer_days)
+        last = pd.Timestamp(cfg.end_date)
+        i0 = max(membership.index.searchsorted(first, side="right") - 1, 0)
+        in_window = membership.iloc[i0:][membership.index[i0:] < last]
+        candidates = sorted(set().union(*in_window.values))
+        print(f"Point-in-time universe: {len(candidates)} tickers were S&P 500 members "
+              f"at some point between {first.date()} and {last.date()}.")
+        raw_prices, raw_volume = pipeline.get_prices(candidates + [bench], with_volume=True)
+        benchmark_prices = raw_prices[bench].dropna()
+        # Short gaps only — never fill across a delisting.
+        universe_prices = raw_prices.drop(columns=[bench]).ffill(limit=5)
+        volume = raw_volume.drop(columns=[bench]).reindex_like(universe_prices)
+        selector = UniverseSelector(cfg, universe_prices, volume, membership)
+    else:
+        raw_prices = pipeline.get_prices()
+        benchmark_prices = raw_prices[bench].dropna()
+        universe_prices = cleaner.clean_prices(raw_prices.drop(columns=[bench]))
+        selector = UniverseSelector(cfg, universe_prices)
 
     bt = Backtester(cfg, universe_prices)
+    decision_dates = [bt.formation_date] + list(bt.rebalance_dates())
+    ever_eligible = sorted(set().union(*(selector.eligible(d) for d in decision_dates)))
+    print(f"{len(ever_eligible)} distinct stocks are investable at some rebalance.")
+
+    if cfg.universe_mode == "pit":
+        fundamentals = pipeline.get_fundamentals(
+            ever_eligible, cache_path=cfg.fundamentals_cache_path.replace(".csv", "_pit.csv"))
+    else:
+        fundamentals = pipeline.get_fundamentals()
+    fundamentals = fundamentals.reindex(universe_prices.columns)
+
+    E = selector.eligible
+
+    def px(d):
+        return universe_prices[E(d)]
+
+    def value_scores(d):
+        return factors.value_score(fundamentals.reindex(E(d)))
+
+    def quality_scores(d):
+        return factors.quality_score(fundamentals.reindex(E(d)))
 
     results = {}
 
     # --- Equal Weight ---
-    results["Equal Weight"] = bt.run(
-        lambda d: constructor.equal_weight(list(universe_prices.columns)),
-        "Equal Weight",
-    )
+    results["Equal Weight"] = bt.run(lambda d: constructor.equal_weight(E(d)), "Equal Weight")
 
     # --- Momentum ---
     results["Momentum"] = bt.run(
-        lambda d: constructor.factor_weighted(factors.momentum_score(universe_prices, d)),
-        "Momentum",
-    )
+        lambda d: constructor.factor_weighted(factors.momentum_score(px(d), d)), "Momentum")
 
     # --- Low Volatility ---
     results["Min Volatility"] = bt.run(
-        lambda d: constructor.factor_weighted(factors.low_vol_score(universe_prices, d)),
-        "Min Volatility",
-    )
+        lambda d: constructor.factor_weighted(factors.low_vol_score(px(d), d)), "Min Volatility")
 
-    # --- Value (static fundamentals snapshot applied throughout) ---
-    value_scores = factors.value_score(fundamentals)
-    results["Value"] = bt.run(
-        lambda d: constructor.factor_weighted(value_scores),
-        "Value",
-    )
-
-    # --- Quality (static fundamentals snapshot applied throughout) ---
-    quality_scores = factors.quality_score(fundamentals)
-    results["Quality"] = bt.run(
-        lambda d: constructor.factor_weighted(quality_scores),
-        "Quality",
-    )
+    # --- Value / Quality (fundamentals snapshot, ranked within each date's universe) ---
+    results["Value"] = bt.run(lambda d: constructor.factor_weighted(value_scores(d)), "Value")
+    results["Quality"] = bt.run(lambda d: constructor.factor_weighted(quality_scores(d)), "Quality")
 
     # --- Multi-Factor blend ---
     def multi_factor_weights(d):
-        mom = factors.momentum_score(universe_prices, d)
-        lv = factors.low_vol_score(universe_prices, d)
-        combined = factors.multi_factor_score(mom, lv, value_scores, quality_scores)
+        prices_d = px(d)
+        combined = factors.multi_factor_score(
+            factors.momentum_score(prices_d, d), factors.low_vol_score(prices_d, d),
+            value_scores(d), quality_scores(d))
         return constructor.factor_weighted(combined)
 
     results["Multi-Factor"] = bt.run(multi_factor_weights, "Multi-Factor")
 
     # --- Minimum Variance (optimized) ---
+    min_names = int(np.ceil(1.0 / cfg.max_weight))
+
     def min_var_weights(d):
-        hist = universe_prices.loc[:d].pct_change().dropna().tail(cfg.vol_lookback)
-        if len(hist) < 60:
-            return constructor.equal_weight(list(universe_prices.columns))
+        hist = (px(d).loc[:d].pct_change(fill_method=None)
+                .tail(cfg.vol_lookback).dropna(axis=1, how="any"))
+        if len(hist) < 60 or hist.shape[1] < min_names:
+            return constructor.equal_weight(E(d))
         return constructor.min_variance(hist)
 
     results["Minimum Variance (Optimized)"] = bt.run(min_var_weights, "Minimum Variance (Optimized)")
 
-    # --- Benchmark equity curve (buy & hold SPY) ---
-    bench_rets = benchmark_prices.pct_change().dropna()
+    # --- Benchmark equity curve (buy & hold SPY), same simulation window ---
+    bench_rets = benchmark_prices.pct_change().reindex(bt.sim_index).fillna(0.0)
     bench_curve = (1 + bench_rets).cumprod()
     bench_curve.iloc[0] = 1.0
+
+    universe_log = [[str(d.date()), *selector.coverage_log[d]]
+                    for d in sorted(selector.coverage_log)]
 
     return {
         "results": results,
         "benchmark_curve": bench_curve,
         "universe_prices": universe_prices,
         "fundamentals": fundamentals,
+        "universe_mode": cfg.universe_mode,
+        "universe_log": universe_log,
     }
 
 
@@ -669,6 +813,20 @@ def generate_investment_memo(report_df: pd.DataFrame) -> str:
     best_sharpe = report_df["Sharpe"].idxmax()
     best_row = report_df.loc[best_sharpe]
 
+    if CFG.universe_mode == "pit":
+        universe_risk = (
+            f"- The universe is point-in-time: each month, the {CFG.pit_top_n} most-traded\n"
+            "  stocks that were in the S&P 500 on that date. Free price data is missing\n"
+            "  for some former members (mostly acquired or delisted companies), so a\n"
+            "  small amount of survivorship bias remains.")
+        universe_next = ("- Fill price gaps for delisted members (e.g. CRSP / Norgate) to remove\n"
+                         "  the remaining survivorship bias.")
+    else:
+        universe_risk = (
+            "- The universe (~30 large-cap names) is not survivorship-bias-free; expanding\n"
+            "  to full historical S&P 500 membership would materially change results.")
+        universe_next = "- Full historical index membership to remove survivorship bias."
+
     memo = f"""
 INVESTMENT MEMO — SMART BETA ETF RESEARCH SUMMARY
 ==================================================
@@ -690,8 +848,7 @@ Risks & Limitations
 --------------------
 - Fundamentals are a current-day snapshot (yfinance), not point-in-time,
   which introduces look-ahead bias versus a production-grade backtest.
-- The universe (~30 large-cap names) is not survivorship-bias-free; expanding
-  to full historical S&P 500 membership would materially change results.
+{universe_risk}
 - Transaction cost assumptions ({CFG.transaction_cost_bps} bps per unit
   turnover) are simplified and do not model market impact or bid-ask spread
   dynamics for less liquid names.
@@ -701,10 +858,9 @@ Risks & Limitations
 Future Improvements
 --------------------
 - Point-in-time fundamentals (FMP / SEC EDGAR) to remove look-ahead bias.
-- Full historical index membership to remove survivorship bias.
+{universe_next}
 - Sector and position-size constraints in the optimizer.
 - Regime-aware dynamic factor allocation.
-- Fama-French regression to report each strategy's factor loadings.
 
 For a plain-language walkthrough of how this dashboard works, where the data comes from,
 and what each performance metric means, see the "How It Works" tab.
@@ -720,6 +876,41 @@ def generate_education_content() -> str:
     and rendered as a dashboard tab (via dcc.Markdown in dash_app.py).
     """
     universe_list = ", ".join(CFG.universe)
+    if CFG.universe_mode == "pit":
+        universe_section = f"""## Which Stocks Are Eligible?
+
+The universe is rebuilt every month using **only information available on that date**:
+
+1. Start from the companies that were in the **S&P 500 on that date** — not today's list.
+   Historical membership comes from a maintained public record of every index change since
+   1996 (github.com/fja05680/sp500).
+2. Keep the ones with enough price history for the factor calculations (about 13 months).
+3. Rank them by **average daily dollar volume over the prior 3 months** and keep the
+   **{CFG.pit_top_n} most-traded**. That's the investable universe for the month.
+
+Why this matters: an earlier version of this project used a fixed list of 30 companies chosen
+in 2026 (Apple, Microsoft, NVIDIA and other names we now know became huge winners). That
+quietly bakes hindsight into every backtest. The Performance tab shows both versions side by
+side so you can see how much that bias inflated the results.
+
+**Remaining limitation:** free price data isn't available for some former index members —
+mostly companies that were acquired or delisted. Those can't be selected, so a small amount of
+survivorship bias remains."""
+        n_equal = CFG.pit_top_n
+    else:
+        universe_section = f"""## Why These Specific Stocks?
+
+The universe is a fixed list of {len(CFG.universe)} large, liquid, well-known U.S. companies:
+{universe_list}.
+
+These weren't picked to make any one strategy look good — they were chosen because they're
+large-cap S&P 500 members with long, complete price histories and reliable data on Yahoo
+Finance, which keeps the demo fast and avoids constant missing-data errors. It is **not** the
+full S&P 500, and it is **not adjusted for survivorship bias** — every company on this list
+still exists and is still doing fine today, which flatters every strategy's results somewhat
+(a real-world backtest would also need to include companies that got delisted, went bankrupt,
+or were acquired along the way). See the Investment Memo tab for more on this limitation."""
+        n_equal = len(CFG.universe)
     return f"""
 ## What This Dashboard Does
 
@@ -738,18 +929,7 @@ full history from {CFG.start_date} to {CFG.end_date}.
   data library) used to check whether a strategy's returns are genuine skill or just a
   disguised bet on a known market factor.
 
-## Why These Specific Stocks?
-
-The universe is a fixed list of {len(CFG.universe)} large, liquid, well-known U.S. companies:
-{universe_list}.
-
-These weren't picked to make any one strategy look good — they were chosen because they're
-large-cap S&P 500 members with long, complete price histories and reliable data on Yahoo
-Finance, which keeps the demo fast and avoids constant missing-data errors. It is **not** the
-full S&P 500, and it is **not adjusted for survivorship bias** — every company on this list
-still exists and is still doing fine today, which flatters every strategy's results somewhat
-(a real-world backtest would also need to include companies that got delisted, went bankrupt,
-or were acquired along the way). See the Investment Memo tab for more on this limitation.
+{universe_section}
 
 ## How Each ETF Actually Decides Its Weights
 
@@ -781,7 +961,7 @@ gets a 0% weight that month. Here's exactly what goes into each score:
   stock's individual volatility) — including how the stocks move together, not just how much
   each one moves alone. A cap of {int(CFG.max_weight * 100)}% per stock keeps it from just
   dumping everything into one or two names.
-- **Equal Weight** — no scoring at all; every stock simply gets 1 ÷ {len(CFG.universe)} of the
+- **Equal Weight** — no scoring at all; every stock simply gets 1 ÷ {n_equal} of the
   portfolio, rebalanced back to equal shares every month.
 
 **A technical note on "scores":** raw numbers like P/E or ROE aren't directly comparable to
@@ -791,8 +971,9 @@ group's average is this stock on this measure" — before stocks are ranked or b
 
 ## How the Backtest Works
 
-Each strategy is simulated month by month: on each rebalance date, the portfolio is
-recalculated using only data available up to that point, then held until the next rebalance.
+Each strategy is simulated month by month: at the close of the last trading day of each month,
+the portfolio is recalculated using only data available up to that point, and the new weights
+start earning returns the next trading day. They're held until the next rebalance.
 A small trading cost ({CFG.transaction_cost_bps} basis points per trade) is subtracted each
 time the portfolio changes, so the results reflect realistic friction rather than a
 frictionless, idealized world.
@@ -815,23 +996,16 @@ frictionless, idealized world.
 
 ## Does This Data Update Automatically?
 
-Honestly — **not by itself, right now.** Live-pulling from Yahoo Finance on every visit would
-be slow and would risk getting the site rate-limited, so instead this dashboard runs the full
-backtest once, saves the results to a small file, and simply displays that saved snapshot. The
-"Data last refreshed" line at the top of the page tells you exactly when that snapshot was
-generated.
-
-To get fresher numbers, the snapshot needs to be manually regenerated and re-uploaded — a
-five-minute process, worth doing every week or two, or whenever this is shared somewhere new.
-True hands-off auto-updating (the site refreshing itself on a schedule with no manual step) is
-possible but requires either a paid hosting tier with unrestricted internet access and a
-scheduled task, or a small automation added on top of this project — ask if you'd like that
-built out.
+Yes — **once a month.** Live-pulling from Yahoo Finance on every visit would be slow and risk
+rate limits, so the full backtest runs on a schedule instead: on the 3rd of each month, GitHub
+Actions rebuilds the data through the last completed month, runs a set of sanity checks, and only
+then publishes it here. If a check fails, the site keeps the previous month's data. The "Data
+refreshed" badge at the top of the page shows when the current snapshot was generated.
 
 ## Important Caveats
 
 This is a research prototype, not investment advice. It uses a snapshot of fundamentals
-rather than true point-in-time data, a fixed universe rather than the full historical S&P 500,
+rather than true point-in-time data, free price data that is missing some delisted companies,
 and simplified trading-cost assumptions. See the Investment Memo tab for the full list of
 limitations and possible next steps.
 """
