@@ -104,6 +104,11 @@ def main():
             # [rebalance date, S&P 500 members, members with price data, selected]
             "log": pipeline_output["universe_log"],
         },
+        "fundamentals": {
+            "source": pipeline_output["fundamentals_source"],
+            # [rebalance date, names, with Value inputs, with Quality inputs]
+            "log": pipeline_output["fundamentals_log"],
+        },
         "comparison": {
             "label": f"Hindsight universe (fixed {len(CFG.universe)} stocks)",
             "results": {

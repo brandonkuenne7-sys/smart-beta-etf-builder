@@ -129,6 +129,16 @@ class Config:
     use_cached_fundamentals: bool = True
     fundamentals_cache_path: str = "/tmp/fundamentals_snapshot.csv"
 
+    # Fundamentals source for Value / Quality:
+    #   "edgar"    — point-in-time: each rebalance only sees figures from SEC
+    #                filings that had been filed by that date (free; needs a
+    #                contact email in SEC_CONTACT_EMAIL, per SEC fair-access rules).
+    #   "snapshot" — today's yfinance ratios applied to every date (the original
+    #                approach; has look-ahead bias).
+    fundamentals_source: str = "edgar"
+    edgar_cache_dir: str = "/tmp/edgar_cache"
+    max_fundamental_age_days: int = 550   # ignore annual figures older than ~18 months
+
 
 CFG = Config()
 
@@ -141,13 +151,16 @@ class DataPipeline:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    def get_prices(self, tickers: Optional[list] = None, with_volume: bool = False,
-                   batch_size: int = 100):
+    def get_market_data(self, tickers: Optional[list] = None, batch_size: int = 100) -> dict:
         """
-        Download adjusted close prices (and optionally volume) for `tickers`
-        (default: the fixed universe + benchmark), in batches. Prices start
-        `history_buffer_days` before start_date so momentum / volatility
-        lookbacks are already full on the first rebalance.
+        Download daily market data for `tickers` (default: the fixed universe +
+        benchmark), in batches. Returns a dict of DataFrames:
+          prices — split- AND dividend-adjusted close (used for returns)
+          close  — split-adjusted close (used with share counts for market cap)
+          volume — daily share volume
+          splits — split ratio on split dates, 0 otherwise
+        Prices start `history_buffer_days` before start_date so momentum /
+        volatility lookbacks are already full on the first rebalance.
         """
         if yf is None:
             raise ImportError(
@@ -163,13 +176,14 @@ class DataPipeline:
         print(f"Downloading price history for {len(tickers)} tickers "
               f"({start} -> {self.cfg.end_date}, incl. lookback buffer) ...")
 
-        closes, volumes, missing = {}, {}, []
+        cols = {"prices": {}, "close": {}, "volume": {}, "splits": {}}
+        missing = []
         for i in range(0, len(tickers), batch_size):
             batch = tickers[i:i + batch_size]
             try:
                 raw = yf.download(
                     batch, start=start, end=self.cfg.end_date,
-                    auto_adjust=True,   # adjusted close folded into 'Close'
+                    auto_adjust=False, actions=True,
                     progress=False, group_by="ticker", threads=True,
                 )
             except Exception as e:
@@ -177,11 +191,14 @@ class DataPipeline:
             for t in batch:
                 try:
                     sub = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
-                    close = sub["Close"]
-                    if close.notna().sum() == 0:
+                    adj = sub["Adj Close"]
+                    if adj.notna().sum() == 0:
                         raise KeyError(t)
-                    closes[t] = close
-                    volumes[t] = sub["Volume"]
+                    cols["prices"][t] = adj
+                    cols["close"][t] = sub["Close"]
+                    cols["volume"][t] = sub["Volume"]
+                    cols["splits"][t] = (sub["Stock Splits"] if "Stock Splits" in sub
+                                         else pd.Series(0.0, index=sub.index))
                 except Exception:
                     missing.append(t)
 
@@ -191,11 +208,19 @@ class DataPipeline:
             print(f"  [warn] no price data for {len(missing)} tickers "
                   f"(typically delisted/acquired): {preview}{more}")
 
-        prices = pd.DataFrame(closes).sort_index().dropna(axis=1, how="all")
-        volume = pd.DataFrame(volumes).sort_index().reindex(columns=prices.columns)
+        prices = pd.DataFrame(cols["prices"]).sort_index().dropna(axis=1, how="all")
+        out = {"prices": prices}
+        for k in ("close", "volume", "splits"):
+            out[k] = pd.DataFrame(cols[k]).sort_index().reindex(index=prices.index, columns=prices.columns)
+        out["splits"] = out["splits"].fillna(0.0)
         print(f"Retrieved prices for {prices.shape[1]} tickers, "
               f"{prices.shape[0]} trading days.")
-        return (prices, volume) if with_volume else prices
+        return out
+
+    def get_prices(self, tickers: Optional[list] = None, with_volume: bool = False):
+        """Backward-compatible wrapper around get_market_data()."""
+        data = self.get_market_data(tickers)
+        return (data["prices"], data["volume"]) if with_volume else data["prices"]
 
     def get_fundamentals(self, tickers: Optional[list] = None,
                          cache_path: Optional[str] = None) -> pd.DataFrame:
@@ -331,6 +356,211 @@ class UniverseSelector:
 
         self._cache[date] = names
         return names
+
+
+class EdgarFundamentals:
+    """
+    Point-in-time fundamentals from SEC EDGAR's free XBRL "company facts" API.
+
+    For a rebalance date d, every figure comes from a filing whose `filed`
+    date is on or before d — exactly what an investor could have known then.
+      - Flow items (net income, revenue): the latest FISCAL-YEAR figure
+        (10-K style, ~12-month duration) available at d.
+      - Balance-sheet items (equity, liabilities, shares): the latest
+        quarterly or annual figure available at d.
+      - Market cap = split-adjusted close on d x reported share count x any
+        splits after the share-count date (so splits don't distort it).
+    Figures older than `max_fundamental_age_days` are treated as missing.
+
+    Output columns match the original yfinance snapshot (trailingPE,
+    priceToBook, returnOnEquity, debtToEquity, profitMargins), so the factor
+    definitions in FactorEngine are unchanged.
+    """
+
+    TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+    FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+    TAGS = {
+        "net_income": [("us-gaap", "NetIncomeLoss"), ("us-gaap", "ProfitLoss"),
+                       ("us-gaap", "NetIncomeLossAvailableToCommonStockholdersBasic")],
+        "revenue": [("us-gaap", "Revenues"),
+                    ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
+                    ("us-gaap", "SalesRevenueNet"),
+                    ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
+                    ("us-gaap", "SalesRevenueGoodsNet")],
+        "equity": [("us-gaap", "StockholdersEquity"),
+                   ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")],
+        "liabilities": [("us-gaap", "Liabilities")],
+        "liab_and_equity": [("us-gaap", "LiabilitiesAndStockholdersEquity")],
+        "shares": [("dei", "EntityCommonStockSharesOutstanding"),
+                   ("us-gaap", "CommonStockSharesOutstanding"),
+                   ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding")],
+    }
+    FLOW_ITEMS = {"net_income", "revenue"}
+
+    def __init__(self, cfg: Config, close: pd.DataFrame, splits: pd.DataFrame):
+        self.cfg = cfg
+        self.close = close
+        self.splits = splits
+        email = os.environ.get("SEC_CONTACT_EMAIL", "").strip()
+        if not email:
+            raise RuntimeError(
+                "SEC EDGAR requires a contact email in the User-Agent. Set the "
+                "SEC_CONTACT_EMAIL environment variable (a GitHub Actions secret in the "
+                "monthly workflow), or use Config.fundamentals_source = 'snapshot'.")
+        self.user_agent = f"smart-beta-etf-builder research {email}"
+        os.makedirs(cfg.edgar_cache_dir, exist_ok=True)
+        self._facts = {}       # ticker -> {item: DataFrame(end, start, filed, val)}
+        self._by_date = {}     # date -> DataFrame of ratios for all loaded tickers
+        self.coverage_log = {} # date -> [names, with value inputs, with quality inputs]
+
+    # ---- download ------------------------------------------------------------
+    def _get_json(self, url: str):
+        import json
+        import time
+        import urllib.request
+        last = None
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": self.user_agent, "Accept-Encoding": "gzip"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    data = r.read()
+                    if r.headers.get("Content-Encoding") == "gzip":
+                        import gzip
+                        data = gzip.decompress(data)
+                time.sleep(0.12)   # stay under SEC's 10 requests/second limit
+                return json.loads(data)
+            except Exception as e:
+                last = e
+                if getattr(e, "code", None) == 404:
+                    return None
+                time.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"SEC request failed: {url}: {last}")
+
+    def _parse(self, facts: dict) -> dict:
+        out = {}
+        for item, tags in self.TAGS.items():
+            frames = []
+            for priority, (ns, tag) in enumerate(tags):
+                units = facts.get("facts", {}).get(ns, {}).get(tag, {}).get("units", {})
+                rows = units.get("shares" if item == "shares" else "USD", [])
+                if not rows:
+                    continue
+                df = pd.DataFrame(rows)
+                if "start" not in df:
+                    df["start"] = pd.NaT
+                df = df[["start", "end", "filed", "val", "accn"]].copy()
+                df["priority"] = priority
+                frames.append(df)
+            if not frames:
+                continue
+            df = pd.concat(frames, ignore_index=True)
+            for c in ("start", "end", "filed"):
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+            df = df.dropna(subset=["end", "filed", "val"])
+            if item in self.FLOW_ITEMS:
+                days = (df["end"] - df["start"]).dt.days
+                df = df[(days >= 350) & (days <= 380)]
+            if item == "shares":
+                # Multi-class issuers sometimes report one row per class in the
+                # same filing: sum them.
+                df = (df.groupby(["end", "filed", "accn", "priority"], as_index=False)["val"].sum())
+            out[item] = df.sort_values(["filed", "end"]).reset_index(drop=True)
+        return out
+
+    def load(self, tickers: list):
+        import json
+        mapping_path = os.path.join(self.cfg.edgar_cache_dir, "company_tickers.json")
+        if os.path.exists(mapping_path):
+            mapping = json.load(open(mapping_path))
+        else:
+            mapping = self._get_json(self.TICKERS_URL)
+            json.dump(mapping, open(mapping_path, "w"))
+        cik_by_ticker = {v["ticker"].upper(): int(v["cik_str"]) for v in mapping.values()}
+
+        todo = [t for t in tickers if t not in self._facts]
+        print(f"Loading point-in-time fundamentals from SEC EDGAR for {len(todo)} tickers ...")
+        no_cik = []
+        for t in todo:
+            cik = cik_by_ticker.get(t.upper())
+            if cik is None:
+                no_cik.append(t)
+                continue
+            path = os.path.join(self.cfg.edgar_cache_dir, f"CIK{cik:010d}.json")
+            if os.path.exists(path):
+                facts = json.load(open(path))
+            else:
+                facts = self._get_json(self.FACTS_URL.format(cik=cik)) or {}
+                # keep only what we use, so retries don't re-download
+                slim = {"facts": {ns: {tag: facts.get("facts", {}).get(ns, {}).get(tag)
+                                        for _, tag in sum(self.TAGS.values(), []) if _ == ns
+                                        and facts.get("facts", {}).get(ns, {}).get(tag)}
+                                  for ns in ("us-gaap", "dei")}}
+                json.dump(slim, open(path, "w"))
+                facts = slim
+            self._facts[t] = self._parse(facts)
+        if no_cik:
+            print(f"  [warn] no current SEC CIK for {len(no_cik)} tickers: {', '.join(sorted(no_cik)[:15])}")
+
+    # ---- point-in-time lookup -------------------------------------------------
+    def _latest(self, df: pd.DataFrame, d: pd.Timestamp):
+        known = df[df["filed"] <= d]
+        if known.empty:
+            return None
+        known = known[known["end"] >= d - pd.Timedelta(days=self.cfg.max_fundamental_age_days)]
+        if known.empty:
+            return None
+        best = known.sort_values(["end", "priority", "filed"], ascending=[False, True, False]).iloc[0]
+        return best
+
+    def _split_factor_after(self, ticker: str, when: pd.Timestamp) -> float:
+        s = self.splits[ticker]
+        s = s[(s.index > when) & (s > 0)]
+        return float(s.prod()) if len(s) else 1.0
+
+    def ratios(self, d: pd.Timestamp, tickers: list) -> pd.DataFrame:
+        rows = {}
+        for t in tickers:
+            f = self._facts.get(t, {})
+            get = {k: (self._latest(f[k], d) if k in f else None) for k in self.TAGS}
+            ni = get["net_income"]["val"] if get["net_income"] is not None else np.nan
+            rev = get["revenue"]["val"] if get["revenue"] is not None else np.nan
+            eq = get["equity"]["val"] if get["equity"] is not None else np.nan
+            if get["liabilities"] is not None:
+                liab = get["liabilities"]["val"]
+            elif get["liab_and_equity"] is not None and np.isfinite(eq):
+                liab = get["liab_and_equity"]["val"] - eq
+            else:
+                liab = np.nan
+            mcap = np.nan
+            sh = get["shares"]
+            if sh is not None and t in self.close.columns and d in self.close.index:
+                px = self.close.at[d, t]
+                if np.isfinite(px) and sh["val"] > 0:
+                    mcap = px * sh["val"] * self._split_factor_after(t, sh["end"])
+            pos_eq = np.isfinite(eq) and eq > 0
+            rows[t] = {
+                "trailingPE": mcap / ni if np.isfinite(ni) and ni != 0 else np.nan,
+                "priceToBook": mcap / eq if np.isfinite(eq) and eq != 0 else np.nan,
+                "returnOnEquity": ni / eq if pos_eq else np.nan,
+                "debtToEquity": 100.0 * liab / eq if pos_eq and np.isfinite(liab) else np.nan,
+                "profitMargins": ni / rev if np.isfinite(rev) and rev > 0 else np.nan,
+            }
+        df = pd.DataFrame.from_dict(rows, orient="index",
+                                    columns=["trailingPE", "priceToBook", "returnOnEquity",
+                                             "debtToEquity", "profitMargins"])
+        return df
+
+    def as_of(self, d: pd.Timestamp, tickers: list) -> pd.DataFrame:
+        key = (d, tuple(tickers))
+        if key not in self._by_date:
+            df = self.ratios(d, tickers)
+            self._by_date[key] = df
+            if d not in self.coverage_log:
+                value_ok = df[["trailingPE", "priceToBook"]].notna().any(axis=1).sum()
+                quality_ok = df[["returnOnEquity", "profitMargins"]].notna().any(axis=1).sum()
+                self.coverage_log[d] = [len(tickers), int(value_ok), int(quality_ok)]
+        return self._by_date[key]
 
 
 # %% CELL 4 — Data Cleaning
@@ -632,14 +862,16 @@ def run_pipeline(cfg: Config):
         candidates = sorted(set().union(*in_window.values))
         print(f"Point-in-time universe: {len(candidates)} tickers were S&P 500 members "
               f"at some point between {first.date()} and {last.date()}.")
-        raw_prices, raw_volume = pipeline.get_prices(candidates + [bench], with_volume=True)
+        market = pipeline.get_market_data(candidates + [bench])
+        raw_prices = market["prices"]
         benchmark_prices = raw_prices[bench].dropna()
         # Short gaps only — never fill across a delisting.
         universe_prices = raw_prices.drop(columns=[bench]).ffill(limit=5)
-        volume = raw_volume.drop(columns=[bench]).reindex_like(universe_prices)
+        volume = market["volume"].drop(columns=[bench]).reindex_like(universe_prices)
         selector = UniverseSelector(cfg, universe_prices, volume, membership)
     else:
-        raw_prices = pipeline.get_prices()
+        market = pipeline.get_market_data()
+        raw_prices = market["prices"]
         benchmark_prices = raw_prices[bench].dropna()
         universe_prices = cleaner.clean_prices(raw_prices.drop(columns=[bench]))
         selector = UniverseSelector(cfg, universe_prices)
@@ -649,23 +881,34 @@ def run_pipeline(cfg: Config):
     ever_eligible = sorted(set().union(*(selector.eligible(d) for d in decision_dates)))
     print(f"{len(ever_eligible)} distinct stocks are investable at some rebalance.")
 
-    if cfg.universe_mode == "pit":
-        fundamentals = pipeline.get_fundamentals(
-            ever_eligible, cache_path=cfg.fundamentals_cache_path.replace(".csv", "_pit.csv"))
-    else:
-        fundamentals = pipeline.get_fundamentals()
-    fundamentals = fundamentals.reindex(universe_prices.columns)
-
     E = selector.eligible
+    edgar = None
+    if cfg.fundamentals_source == "edgar":
+        edgar = EdgarFundamentals(cfg, market["close"].ffill(limit=5), market["splits"])
+        edgar.load(ever_eligible)
+
+        def fundamentals_at(d):
+            return edgar.as_of(d, E(d))
+        fundamentals = None
+    else:
+        if cfg.universe_mode == "pit":
+            fundamentals = pipeline.get_fundamentals(
+                ever_eligible, cache_path=cfg.fundamentals_cache_path.replace(".csv", "_pit.csv"))
+        else:
+            fundamentals = pipeline.get_fundamentals()
+        fundamentals = fundamentals.reindex(universe_prices.columns)
+
+        def fundamentals_at(d):
+            return fundamentals.reindex(E(d))
 
     def px(d):
         return universe_prices[E(d)]
 
     def value_scores(d):
-        return factors.value_score(fundamentals.reindex(E(d)))
+        return factors.value_score(fundamentals_at(d))
 
     def quality_scores(d):
-        return factors.quality_score(fundamentals.reindex(E(d)))
+        return factors.quality_score(fundamentals_at(d))
 
     results = {}
 
@@ -680,7 +923,7 @@ def run_pipeline(cfg: Config):
     results["Min Volatility"] = bt.run(
         lambda d: constructor.factor_weighted(factors.low_vol_score(px(d), d)), "Min Volatility")
 
-    # --- Value / Quality (fundamentals snapshot, ranked within each date's universe) ---
+    # --- Value / Quality (fundamentals as known on each date, ranked within that date's universe) ---
     results["Value"] = bt.run(lambda d: constructor.factor_weighted(value_scores(d)), "Value")
     results["Quality"] = bt.run(lambda d: constructor.factor_weighted(quality_scores(d)), "Quality")
 
@@ -713,6 +956,8 @@ def run_pipeline(cfg: Config):
 
     universe_log = [[str(d.date()), *selector.coverage_log[d]]
                     for d in sorted(selector.coverage_log)]
+    fundamentals_log = ([[str(d.date()), *edgar.coverage_log[d]] for d in sorted(edgar.coverage_log)]
+                        if edgar else [])
 
     return {
         "results": results,
@@ -721,6 +966,8 @@ def run_pipeline(cfg: Config):
         "fundamentals": fundamentals,
         "universe_mode": cfg.universe_mode,
         "universe_log": universe_log,
+        "fundamentals_source": cfg.fundamentals_source,
+        "fundamentals_log": fundamentals_log,
     }
 
 
@@ -841,6 +1088,19 @@ def generate_investment_memo(report_df: pd.DataFrame) -> str:
             "  to full historical S&P 500 membership would materially change results.")
         universe_next = "- Full historical index membership to remove survivorship bias."
 
+    if CFG.fundamentals_source == "edgar":
+        fundamentals_risk = (
+            "- Value and Quality use point-in-time SEC EDGAR filings (only figures filed\n"
+            "  by each rebalance date), based on the latest annual report. A few\n"
+            "  companies (e.g. some multi-class issuers) lack usable share counts and\n"
+            "  get no Value score.")
+        fundamentals_next = "- Quarterly (trailing-twelve-month) fundamentals instead of annual figures."
+    else:
+        fundamentals_risk = (
+            "- Fundamentals are a current-day snapshot (yfinance), not point-in-time,\n"
+            "  which introduces look-ahead bias versus a production-grade backtest.")
+        fundamentals_next = "- Point-in-time fundamentals (FMP / SEC EDGAR) to remove look-ahead bias."
+
     memo = f"""
 INVESTMENT MEMO — SMART BETA ETF RESEARCH SUMMARY
 ==================================================
@@ -860,8 +1120,7 @@ Max Drawdown: {best_row['Max Drawdown']:.2%}).
 
 Risks & Limitations
 --------------------
-- Fundamentals are a current-day snapshot (yfinance), not point-in-time,
-  which introduces look-ahead bias versus a production-grade backtest.
+{fundamentals_risk}
 {universe_risk}
 - Transaction cost assumptions ({CFG.transaction_cost_bps} bps per unit
   turnover) are simplified and do not model market impact or bid-ask spread
@@ -871,7 +1130,7 @@ Risks & Limitations
 
 Future Improvements
 --------------------
-- Point-in-time fundamentals (FMP / SEC EDGAR) to remove look-ahead bias.
+{fundamentals_next}
 {universe_next}
 - Sector and position-size constraints in the optimizer.
 - Regime-aware dynamic factor allocation.
@@ -890,6 +1149,15 @@ def generate_education_content() -> str:
     and rendered as a dashboard tab (via dcc.Markdown in dash_app.py).
     """
     universe_list = ", ".join(CFG.universe)
+    if CFG.fundamentals_source == "edgar":
+        fundamentals_line = (
+            "- **Fundamentals** — net income, revenue, equity, liabilities and share counts from\n"
+            "  companies' own SEC filings (EDGAR). Each month only uses filings that had already\n"
+            "  been published by that date, so the backtest never \"knows\" a number early.")
+    else:
+        fundamentals_line = (
+            "- **Fundamentals** — company financial ratios (like P/E ratio and profitability), also from\n"
+            "  Yahoo Finance, captured as a single snapshot in time.")
     if CFG.universe_mode == "pit":
         universe_section = f"""## Which Stocks Are Eligible?
 
@@ -937,8 +1205,7 @@ full history from {CFG.start_date} to {CFG.end_date}.
 ## Where the Data Comes From
 
 - **Prices** — daily stock prices, pulled from Yahoo Finance.
-- **Fundamentals** — company financial ratios (like P/E ratio and profitability), also from
-  Yahoo Finance, captured as a single snapshot in time.
+{fundamentals_line}
 - **Fama-French factors** — a well-known academic dataset (from Dartmouth's Kenneth French
   data library) used to check whether a strategy's returns are genuine skill or just a
   disguised bet on a known market factor.
@@ -1018,9 +1285,9 @@ refreshed" badge at the top of the page shows when the current snapshot was gene
 
 ## Important Caveats
 
-This is a research prototype, not investment advice. It uses a snapshot of fundamentals
-rather than true point-in-time data, free price data that is missing some delisted companies,
-and simplified trading-cost assumptions. See the Investment Memo tab for the full list of
+This is a research prototype, not investment advice. Fundamentals come from annual SEC filings
+(not quarterly), free price data is missing some delisted companies, and trading costs are
+simplified. See the Investment Memo tab for the full list of
 limitations and possible next steps.
 """
 

@@ -338,8 +338,14 @@ Backtest timing was tightened at the same time: rebalances happen on the last **
 each month, new weights start earning the **next** day (no same-day look-ahead), and price history
 before `start_date` is used only for factor lookbacks, so every strategy is invested from day one.
 
+**Point-in-time fundamentals:** Value and Quality now use SEC EDGAR's free XBRL company-facts API
+(`EdgarFundamentals` in the engine). At each rebalance only filings already *filed* by that date
+are used: the latest annual net income and revenue, the latest reported equity, liabilities and
+share count. Market cap is the split-adjusted close × reported shares × any later splits. SEC
+requires a contact email in requests, supplied via the `SEC_CONTACT_EMAIL` secret.
+
 **Known remaining biases:** free price data is missing for some delisted/acquired members, and
-fundamentals are a current snapshot rather than point-in-time.
+fundamentals use annual (not trailing-twelve-month) figures.
 
 ---
 

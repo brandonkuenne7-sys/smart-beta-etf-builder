@@ -5,6 +5,7 @@
 # here on GitHub's servers and pushed INTO PythonAnywhere:
 #
 #   1. Refresh S&P 500 membership history, then rebuild pipeline_cache.json
+#      (prices: Yahoo Finance; point-in-time fundamentals: SEC EDGAR)
 #      through the last completed month (point-in-time universe + hindsight comparison)
 #   2. Validate it (validate_cache.py), retrying up to 3 times — if it still
 #      fails, stop; the site keeps last month's data and GitHub emails you
@@ -12,8 +13,9 @@
 #   4. Upload it to PythonAnywhere via their API and reload the site
 #   5. Confirm the live site is serving the new data
 #
-# Setup: add a repository secret named PA_API_TOKEN (PythonAnywhere →
-# Account → API Token). Until it exists, steps 1–3 still run and deploy is
+# Setup: repository secrets PA_API_TOKEN (PythonAnywhere → Account → API
+# Token) and SEC_CONTACT_EMAIL (contact address SEC requires for EDGAR).
+# Without PA_API_TOKEN, steps 1–3 still run and deploy is
 # skipped with a warning.
 #
 # Manual run: Actions tab → "Monthly data refresh" → Run workflow.
@@ -65,6 +67,8 @@ jobs:
         run: python scripts/update_membership.py
 
       - name: Rebuild and validate (up to 3 attempts)
+        env:
+          SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}   # SEC EDGAR fair-access contact
         # Yahoo occasionally rate-limits or returns blank fundamentals without
         # erroring, so each attempt clears the engine's fundamentals snapshot
         # and must pass validate_cache.py before anything is published.

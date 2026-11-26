@@ -23,6 +23,7 @@ SHARPE_RANGE = (-2.0, 4.0)       # anything outside this is almost certainly a d
 CAGR_RANGE = (-0.5, 1.0)
 MIN_PRICE_COVERAGE = 0.80        # avg share of S&P 500 members with usable price data
 MIN_FULL_UNIVERSE_SHARE = 0.95   # share of rebalances that fill the full top-N universe
+MIN_FUNDAMENTALS_COVERAGE = 0.70 # avg share of each month's names with Value / Quality inputs
 
 
 def _day(s: str) -> date:
@@ -103,6 +104,17 @@ def validate(cache: dict, previous: dict | None) -> list[str]:
                 errors.append(f"only {coverage:.0%} of S&P 500 members had price data on average")
             if full < MIN_FULL_UNIVERSE_SHARE:
                 errors.append(f"only {full:.0%} of rebalances filled the top-{universe['top_n']} universe")
+
+    fund = cache.get("fundamentals") or {}
+    if fund.get("source") == "edgar":
+        flog = fund.get("log") or []
+        if not flog:
+            errors.append("EDGAR fundamentals log is empty")
+        else:
+            v = sum(r[2] / r[1] for r in flog if r[1]) / len(flog)
+            q = sum(r[3] / r[1] for r in flog if r[1]) / len(flog)
+            if v < MIN_FUNDAMENTALS_COVERAGE or q < MIN_FUNDAMENTALS_COVERAGE:
+                errors.append(f"EDGAR coverage too low: Value inputs {v:.0%}, Quality inputs {q:.0%}")
 
     comparison = cache.get("comparison")
     if universe and universe.get("mode") == "pit":
