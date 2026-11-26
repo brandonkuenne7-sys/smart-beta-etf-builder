@@ -26,6 +26,7 @@ import json
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, dcc, html, dash_table, Input, Output
+from dash.dash_table.Format import Format, Scheme
 
 from smart_beta_etf_builder import (
     CFG, run_pipeline, PerformanceAnalytics, FamaFrenchAnalytics,
@@ -213,6 +214,97 @@ def _tooltip_header(columns):
         c: {"value": METRIC_DEFINITIONS[c], "type": "markdown"}
         for c in columns if c in METRIC_DEFINITIONS
     }
+
+
+# ---- Table display formats (presentation only; underlying numbers unchanged) ----
+# Formats are applied by the DataTable itself, so sorting still works on the
+# raw numeric values.
+_PCT_1 = Format(precision=1, scheme=Scheme.percentage)
+_FIXED_2 = Format(precision=2, scheme=Scheme.fixed)
+_INT = Format(precision=0, scheme=Scheme.fixed)
+
+_METRIC_PCT_COLS = {"CAGR", "Ann. Volatility", "Max Drawdown", "Avg Turnover"}
+_FF_PAIRS = [("Annualized Alpha", "Alpha t-stat")] + [
+    (f"Beta ({f})", f"t-stat ({f})") for f in ("Mkt-RF", "SMB", "HML", "RMW", "CMA")
+]
+SIGNIFICANCE_T = 2.0
+_STRATEGY_COL_LEFT = [{"if": {"column_id": "Strategy"}, "textAlign": "left", "fontWeight": 500}]
+
+
+def _table_columns(columns, pct_cols=(), int_cols=()):
+    out = []
+    for c in columns:
+        if c == "Strategy":
+            out.append({"name": c, "id": c})
+        elif c in pct_cols:
+            out.append({"name": c, "id": c, "type": "numeric", "format": _PCT_1})
+        elif c in int_cols:
+            out.append({"name": c, "id": c, "type": "numeric", "format": _INT})
+        else:
+            out.append({"name": c, "id": c, "type": "numeric", "format": _FIXED_2})
+    return out
+
+
+def _ff_significance_styles():
+    """Shade each coefficient and its t-stat when |t| >= 2; colour alpha by sign."""
+    rules = []
+    for coef, tcol in _FF_PAIRS:
+        query = f"{{{tcol}}} >= {SIGNIFICANCE_T} || {{{tcol}}} <= -{SIGNIFICANCE_T}"
+        for col in (coef, tcol):
+            rules.append({"if": {"filter_query": query, "column_id": col},
+                          "backgroundColor": "var(--accent-soft)", "fontWeight": 600,
+                          "color": "var(--text-primary)"})
+    rules += [
+        {"if": {"filter_query": f"{{Alpha t-stat}} >= {SIGNIFICANCE_T}", "column_id": "Annualized Alpha"},
+         "backgroundColor": "var(--positive-soft)", "color": "var(--positive)", "fontWeight": 600},
+        {"if": {"filter_query": f"{{Alpha t-stat}} <= -{SIGNIFICANCE_T}", "column_id": "Annualized Alpha"},
+         "backgroundColor": "var(--negative-soft)", "color": "var(--negative)", "fontWeight": 600},
+    ]
+    return rules
+
+
+def _memo_to_components(text):
+    """Turn the engine's plain-text memo (underlined headings, '- ' bullets,
+    wrapped lines) into structured HTML. The memo text itself is unchanged."""
+    lines = text.strip("\n").split("\n")
+    blocks, para, bullets = [], [], []
+
+    def flush():
+        if para:
+            blocks.append(html.P(" ".join(para), className="memo-p"))
+            para.clear()
+        if bullets:
+            blocks.append(html.Ul([html.Li(b) for b in bullets], className="memo-list"))
+            bullets.clear()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if line and nxt and set(nxt) <= {"=", "-"} and len(nxt) >= 3:
+            flush()
+            if set(nxt) == {"="}:
+                pass  # document title — the card already has a heading
+            else:
+                blocks.append(html.H4(line.strip(), className="memo-h"))
+            i += 2
+            continue
+        stripped = line.strip()
+        if not stripped:
+            flush()
+        elif stripped.startswith("- "):
+            if para:
+                flush()
+            bullets.append(stripped[2:])
+        elif bullets and line.startswith("  "):
+            bullets[-1] += " " + stripped       # continuation of a wrapped bullet
+        else:
+            if bullets:
+                flush()
+            para.append(stripped)
+        i += 1
+    flush()
+    return blocks
 
 # -----------------------------------------------------------------------------
 # 2. App shell, design tokens, and derived (KPI) data
@@ -409,7 +501,8 @@ performance_tab = html.Div([
         dbc.AccordionItem(
             dash_table.DataTable(
                 id="metrics-table",
-                columns=[{"name": c, "id": c} for c in METRICS_DF.columns],
+                columns=_table_columns(METRICS_DF.columns, pct_cols=_METRIC_PCT_COLS),
+                style_cell_conditional=_STRATEGY_COL_LEFT,
                 data=METRICS_DF.to_dict("records"),
                 tooltip_header=_tooltip_header(METRICS_DF.columns),
                 tooltip_delay=0, tooltip_duration=None,
@@ -490,10 +583,18 @@ attribution_tab = html.Div([
         html.Div("Fama-French 5-Factor Attribution", className="section-title"),
         html.P("Annualized alpha and factor loadings vs. Mkt-RF, SMB, HML, RMW, CMA. Hover any "
                "column header for a definition.", className="section-desc"),
+        html.Div([
+            html.Span(className="sig-swatch sig-swatch-accent"), "Statistically significant (|t| ≥ 2)",
+            html.Span(className="sig-swatch sig-swatch-positive"), "Significant positive alpha",
+            html.Span(className="sig-swatch sig-swatch-negative"), "Significant negative alpha",
+        ], className="sig-legend"),
         (dash_table.DataTable(
             id="ff-table",
-            columns=[{"name": c, "id": c} for c in FF_DF.columns],
+            columns=_table_columns(FF_DF.columns, pct_cols={"Annualized Alpha"},
+                                   int_cols={"N Observations"}),
             data=FF_DF.to_dict("records"),
+            style_data_conditional=_ff_significance_styles(),
+            style_cell_conditional=_STRATEGY_COL_LEFT,
             tooltip_header=_tooltip_header(FF_DF.columns),
             tooltip_delay=0, tooltip_duration=None,
             style_cell={"padding": "10px 14px", "fontFamily": "Inter, Arial", "fontSize": 13,
@@ -526,12 +627,7 @@ memo_tab = html.Div([
         html.Div("Investment Memo", className="section-title"),
         html.P("Auto-generated summary of strategy performance, risks, and next steps.",
                className="section-desc"),
-        html.Pre(MEMO_TEXT, style={
-            "whiteSpace": "pre-wrap", "fontFamily": "SFMono-Regular, Consolas, monospace",
-            "fontSize": "13px", "lineHeight": "1.7", "color": "var(--text-primary)",
-            "background": "var(--surface-alt)", "padding": "20px", "borderRadius": "10px",
-            "border": "1px solid var(--border)",
-        }),
+        html.Div(_memo_to_components(MEMO_TEXT), className="memo-body"),
     ], className="section-card"),
 ], className="fade-in")
 
