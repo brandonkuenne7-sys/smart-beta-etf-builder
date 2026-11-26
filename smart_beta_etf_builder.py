@@ -253,15 +253,29 @@ class DataPipeline:
         return fdf
 
 
+# Ticker renames where Yahoo Finance keeps the full price history under the
+# NEW symbol only. The membership file records the symbol in use at the time,
+# so without this map, e.g., Facebook would be missing before it became META.
+# Only renames of the same company (not mergers into a different company).
+TICKER_RENAMES = {
+    "FB": "META", "PCLN": "BKNG", "ANTM": "ELV", "UTX": "RTX", "ABC": "COR",
+    "HRS": "LHX", "BBT": "TFC", "SYMC": "GEN", "NLOK": "GEN", "KORS": "CPRI",
+    "WLTW": "WTW", "DWDP": "DD", "ADS": "BFH", "FBHS": "FBIN", "PKI": "RVTY",
+    "RE": "EG", "FLT": "CPAY", "CDAY": "DAY", "COG": "CTRA",
+}
+
+
 def load_sp500_membership(path: str) -> pd.Series:
     """
     Historical S&P 500 membership, one row per date the index changed
     (source: github.com/fja05680/sp500). Returns a Series indexed by date
-    whose values are frozensets of tickers in Yahoo format (BRK.B -> BRK-B).
+    whose values are frozensets of tickers in Yahoo format (BRK.B -> BRK-B,
+    renamed symbols mapped to their current one).
     """
     df = pd.read_csv(path, parse_dates=["date"]).sort_values("date")
     return pd.Series(
-        [frozenset(t.strip().replace(".", "-") for t in row.split(",") if t.strip())
+        [frozenset(TICKER_RENAMES.get(t.strip(), t.strip()).replace(".", "-")
+                   for t in row.split(",") if t.strip())
          for row in df["tickers"]],
         index=pd.DatetimeIndex(df["date"]),
     )
