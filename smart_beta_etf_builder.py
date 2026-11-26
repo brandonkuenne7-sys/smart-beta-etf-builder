@@ -1183,7 +1183,7 @@ Future Improvements
 --------------------
 {fundamentals_next}
 {universe_next}
-- Sector and position-size constraints in the optimizer.
+- Sector constraints (positions are capped at 10%, but sector weights are not).
 - Regime-aware dynamic factor allocation.
 
 For a plain-language walkthrough of how this dashboard works, where the data comes from,
